@@ -65,31 +65,33 @@ Phase 9: 持续追踪 [Ongoing]
 ```
 QuantLab/
 │
-├── README.md                              # 你在看的这一页
-├── QAT_LEARNING_ROADMAP.md                # 9 阶段完整路线图（全局导航）
+├── README.md                         # 你在看的这一页
+├── QAT_LEARNING_ROADMAP.md           # 9 阶段完整路线图（全局导航）
 │
-├── Stage0_量化基础与硬件基石.md            # 浮点数的位布局、量化公式手推、
-│   │                                        四种校准器手写、硬件为什么能加速
-│   │                                      # 🔍 源码深潜: Observer 继承树、
-│   │                                        FakeQuantize 状态机内核、
-│   │                                        QuantStub/DeQuantStub 生命周期、
-│   │                                        fuse_modules 内部全流程、
-│   │                                        prepare_qat/convert 管线
-│   │
-├── Stage1_PyTorch原生QAT三种模式.md        # Eager/FX/PT2E 三代 API 逐个走、
-│   │                                        prepare_qat_fx 图改写源码分析、
-│   │                                        convert_fx 源码分析、
-│   │                                        Conv+BN 融合数学推导、
-│   │                                        QConfigMapping 优先级系统
-│   │
-├── Stage2_LSQ与可微量化参数.md             # [Next] 从零实现 LSQ
-├── Stage3_PTQ进阶算法.md                   # [Planned] AdaRound→GPTQ
-├── Stage4_YOLO量化实战.md                  # [Planned]
-├── Stage5_工业级框架.md                    # [Planned] PPQ + AIMET
-├── Stage6_大模型PTQ.md                     # [Planned]
-├── Stage7_大模型QAT.md                     # [Planned]
-├── Stage8_端侧部署全链路.md                # [Planned]
-└── Stage9_前沿追踪.md                     # [Ongoing]
+├── 📖 docs/                          # 学习文档（理论阅读 + 动手实验）
+│   ├── Stage0_量化基础与硬件基石.md
+│   ├── Stage1_PyTorch原生QAT三种模式.md
+│   ├── Stage2_LSQ与可微量化参数.md          # [Next]
+│   └── ... (Stage3~Stage9)                  # [Planned]
+│
+├── 🔍 source-notes/                  # PyTorch 源码分析笔记
+│   └── 拆解: observer.py / fake_quantize.py /
+│            stubs.py / fuse_modules.py /
+│            quantize_fx.py / convert.py ...
+│
+├── 💻 code/                          # 独立可运行的实现代码
+│   ├── calibrators/                  # 四种校准器手写实现
+│   ├── quantizers/                   # 从零实现的量化器
+│   ├── lsq/                          # LSQ 从零实现 (Stage 2)
+│   ├── adaround/                     # AdaRound 复现 (Stage 3)
+│   ├── gptq/                         # GPTQ 核心逻辑 (Stage 3)
+│   ├── yolov8_qat/                   # YOLOv8 QAT 项目 (Stage 4)
+│   └── utils/                        # 公共工具
+│
+└── 📝 paper-notes/                   # 核心论文阅读笔记
+    ├── LSQ / AdaRound / GPTQ /
+    ├── AWQ / SmoothQuant / SpinQuant /
+    └── QLoRA / LLM-QAT / BitNet ...
 ```
 
 ---
