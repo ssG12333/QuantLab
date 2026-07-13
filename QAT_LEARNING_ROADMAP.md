@@ -1185,317 +1185,227 @@ def spinquant_learn_rotation(X_calib, W, n_rotations=4, lr=0.01, steps=100):
 
 ---
 
-## 阶段 7：大模型 QAT — LLM-QAT / QLoRA / EfficientQAT
+## 阶段 7：大模型 QAT — LLM-QAT / QLoRA / EfficientQAT / BitDistiller
 
 > ⏱ 预计时间：3-4 周 | 🎯 难度：⭐⭐⭐⭐⭐
+>
+> 这一阶段是整个学习路径的"珠峰"——将 QAT 的思想应用到 7B~70B 的 LLM 上。
+> **核心矛盾**：你不可能对 70B 模型做全量 QAT（显存和时间都不允许），所以必须借助 PEFT / KD / 两阶段训练来间接实现。
 
-这是最难但也最有价值的一个阶段。LLM 的 QAT 和 CNN 的 QAT 在工程上完全不同：你不可能对 70B 模型做全量 QAT。
+### 7.1 细粒度学习路径
 
-### 7.1 你需要吃透什么
+```
+Week 1: QLoRA — 4-bit 量化 + LoRA 微调
+  ├── 子路径 1.1: NF4 数据格式
+  │     ├── 知识点: NF4 是非均匀量化——量化等级在概率密度高的区域更密
+  │     ├── 动手: 手写 NF4 量化表（16 个值的精确位置）
+  │     ├── 对比: NF4 vs INT4 vs FP4 在正态分布下的量化 SNR
+  │     └── 吃透: 为什么 NF4 对 LLM 权重（近似正态分布）最优
+  │
+  ├── 子路径 1.2: Double Quantization（双重量化）
+  │     ├── 知识点: 对 scale 再做一次量化——省 0.4 bit/param
+  │     ├── 动手: 计算 7B 模型 W4A16 的显存占用，含/不含 double quant
+  │     └── 吃透: 为什么双层量化几乎无损（scale 的分布极窄）
+  │
+  ├── 子路径 1.3: QLoRA 训练循环
+  │     ├── 知识点: base model 4-bit 冻结 + LoRA adapter BP16 训练
+  │     ├── 动手: 用 QLoRA 微调 LLaMA-7B 到 Alpaca 数据集
+  │     ├── 坑: LoRA target_modules 的选择影响收敛速度
+  │     └── 坑: 4-bit 模型不能直接 .to(device)，必须用 device_map="auto"
+  │
+  └── 子路径 1.4: bitsandbytes 源码深潜
+        ├── 知识点: bitsandbytes 如何实现 CUDA 端 4-bit 矩阵乘法
+        ├── 知识点: NF4 dequant → FP16 → matmul 的数据流
+        └── 吃透: 为什么 QLoRA 的 forward 比 FP16 慢（dequant overhead）
 
-| # | 知识点 | 深度要求 |
-|---|--------|----------|
-| 1 | **LLM-QAT 的数据生成策略**：用大模型自身生成训练数据 | 理解为什么 pre-training data distillation 是必要的 |
-| 2 | **QLoRA 的双重量化**：NF4 权重 + 4-bit 量化 LoRA adapter | 理解 double quantization 为什么能进一步节省 0.4 bit/param |
-| 3 | **NF4 (NormalFloat4)**：非均匀量化，针对正态分布优化 | 能手写 NF4 的量化/反量化 |
-| 4 | **EfficientQAT**：weight-only QAT → weight+activation QAT 两阶段策略 | 理解为何分两阶段训练 |
-| 5 | **BitDistiller**：用更大的教师模型蒸馏到量化学生模型 | 理解 KD loss + quantization loss 的联合优化 |
-| 6 | **知识蒸馏在 QAT 中的作用**：soft label 引导量化模型恢复精度 | 理解温度参数在 KD + QAT 中的设置 |
-| 7 | **PEFT + 量化**：LoRA/QLoRA adapter 在量化模型上的训练 | 理解 base model 冻结 + adapter 训练的计算图 |
+Week 2: LLM-QAT — 数据蒸馏 + KD 驱动 QAT
+  ├── 子路径 2.1: 为什么需要数据蒸馏
+  │     ├── 知识点: QAT 需要大量数据，但 LLM 训练数据不可获取
+  │     ├── 知识点: 用 teacher LLM 生成 pseudo-data + 保留 soft label
+  │     └── 动手: 用 LLaMA-7B 生成 10K 条 token 序列作为 QAT 数据
+  │
+  ├── 子路径 2.2: KD + QAT 联合训练
+  │     ├── 知识点: L_total = α × L_LM + β × L_KD
+  │     ├── 知识点: 温度 T 的作用——T 大则 soft label 更平滑（提供更多信息）
+  │     ├── 动手: 实现 KD loss + CE loss 的联合训练循环
+  │     └── 对比: KD QAT vs plain QAT vs FP16 baseline 的 PPL
+  │
+  └── 子路径 2.3: LLM-QAT 的局限性
+        ├── 知识点: 生成数据的分布偏差（teacher 的偏好被传递）
+        └── 知识点: 数据蒸馏适用于"知识密集型"任务，不适用于"推理型"
 
-### 7.2 怎么做
+Week 3: EfficientQAT — 两阶段训练 + BitDistiller
+  ├── 子路径 3.1: EfficientQAT 两阶段
+  │     ├── 知识点: Phase 1 (W-only QAT) 先让权重量化适应
+  │     ├── 知识点: Phase 2 (W+A QAT) 再加入激活量化——分阶段降低难度
+  │     ├── 动手: 对比单阶段和两阶段 QAT 在 7B 上的收敛曲线
+  │     └── 吃透: 为什么分阶段比直接 W+A QAT 收敛更稳定
+  │
+  ├── 子路径 3.2: BitDistiller — 蒸馏增强量化
+  │     ├── 知识点: 用更大的 teacher 模型蒸馏到更小的量化 student
+  │     ├── 知识点: KD 补偿了量化引入的 capacity loss
+  │     └── 动手: 7B QAT + 13B teacher KD → 对比纯 QAT
+  │
+  └── 子路径 3.3: W4A4 的极限挑战
+        ├── 知识点: W4A4 比 W4A16 多一个数量级的难度
+        ├── 知识点: 需要 SmoothQuant/SpinQuant 预处理消除 Outlier
+        └── 吃透: W4A4 瓶颈在激活量化，不是权重量化
 
-#### 7.2a：QLoRA 实战（基础）
-
-```python
-# ========== QLoRA: 4-bit 模型 + LoRA 微调 ==========
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainingArguments,
-)
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from datasets import load_dataset
-
-model_id = "meta-llama/Llama-2-7b-hf"
-
-# Step 1: 4-bit 量化配置（NF4）
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,              # 4-bit 量化加载
-    bnb_4bit_quant_type="nf4",      # NormalFloat4 数据类型
-    bnb_4bit_use_double_quant=True, # 双重量化（再省 0.4 bit/param）
-    bnb_4bit_compute_dtype=torch.bfloat16,  # 计算时用 BF16
-)
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    quantization_config=bnb_config,
-    device_map="auto",
-    trust_remote_code=True,
-)
-
-# Step 2: QLoRA 适配器配置
-model = prepare_model_for_kbit_training(model)
-
-lora_config = LoraConfig(
-    r=16,                # LoRA 秩
-    lora_alpha=32,       # LoRA 缩放系数
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-
-model = get_peft_model(model, lora_config)
-print(model.print_trainable_parameters())
-# trainable params: ~4.2M / total: ~6.7B = 0.06%
-
-# Step 3: 训练（标准 HF Trainer）
-trainer = SFTTrainer(
-    model=model,
-    args=TrainingArguments(
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        learning_rate=2e-4,
-        fp16=True,
-        logging_steps=10,
-    ),
-    train_dataset=dataset,
-)
-trainer.train()
+Week 4: 综合实战 + 对比
+  ├── 用 QLoRA 微调 LLaMA-3-8B + 评测 MMLU
+  ├── 对比 QLoRA / LLM-QAT / EfficientQAT 三者在 W4A16 下的 PPL + MMLU
+  └── 画"方法 vs 精度 vs 训练成本"的三维对比图
 ```
 
-#### 7.2b：LLM-QAT 理解
+### 7.2 关键论文 + 源码
 
-```python
-# ========== LLM-QAT 核心思想（概念代码） ==========
-"""
-LLM-QAT 的核心流程:
+| 资源 | 重点 |
+|------|------|
+| 📄 QLoRA (NeurIPS 2023) | NF4 量化表推导 + Double Quant 理论 |
+| 📄 LLM-QAT (ICLR 2024) | Data-free KD pipeline |
+| 📄 EfficientQAT (2024) | 两阶段训练的理论依据 |
+| 📄 BitDistiller (2024) | KD + Quantization 联合优化的 loss 设计 |
+| 🛠 bitsandbytes | 读 `bitsandbytes/functional.py` 的 NF4 dequant 实现 |
+| 🛠 PEFT | 读 `peft/tuners/lora.py` 理解 LoRA 在量化模型上的 forward |
 
-Phase 1 — Data Generation (Pre-training Data Distillation):
-  - 用 FP16 的大模型生成 token 序列
-  - 保留 teacher 的 logits 作为软标签
-  - 目的：让量化模型"看到"足够多的数据
+### 7.3 检验标准
 
-Phase 2 — QAT with KD:
-  - 加载数据 + 软标签
-  - 插入 FakeQuantization 节点
-  - 联合优化: L = α * L_LM + β * L_KD
-    - L_LM: 标准的自回归语言模型损失
-    - L_KD: 与 teacher logits 的 KL 散度
-
-Phase 3 — 导出:
-  - 转换为真实量化格式
-"""
-
-# 伪代码
-def llm_qat_training(model_fp16, model_q, tokenizer, dataset):
-    """
-    model_fp16: 全精度教师模型
-    model_q: 插入 FakeQuant 的学生模型
-    """
-    for batch in dataset:
-        # Step 1: 从教师模型获取 logits
-        with torch.no_grad():
-            teacher_logits = model_fp16(batch['input_ids']).logits
-
-        # Step 2: 学生模型前向（带 FakeQuant）
-        student_logits = model_q(batch['input_ids']).logits
-
-        # Step 3: 联合损失
-        loss_lm = F.cross_entropy(
-            student_logits.view(-1, vocab_size),
-            batch['labels'].view(-1)
-        )
-        loss_kd = F.kl_div(
-            F.log_softmax(student_logits / T, dim=-1),
-            F.softmax(teacher_logits / T, dim=-1),
-            reduction='batchmean',
-        ) * (T ** 2)
-
-        loss = 0.5 * loss_lm + 0.5 * loss_kd
-
-        loss.backward()
-        optimizer.step()
-```
-
-#### 7.2c：EfficientQAT 两阶段策略
-
-```python
-# ========== EfficientQAT 的两阶段训练 ==========
-"""
-Stage 1: Weight-only Quantization
-  - 只量化权重，激活保持 FP16
-  - 这阶段训练快，因为激活不需要 FakeQuant
-  - 恢复大部分精度损失
-
-Stage 2: Weight + Activation Quantization
-  - 在 Stage 1 的基础上，激活也加入量化
-  - 训练变慢但进一步恢复精度
-  - 最终达到 W4A4 或 W4A8
-"""
-
-# 伪代码
-model_q = insert_weight_fakequant(model)     # Stage 1: 只量化权重
-train(model_q, epochs=5)                     # 权重适应量化噪声
-
-model_q = insert_activation_fakequant(model_q)  # Stage 2: 加入激活量化
-train(model_q, epochs=5)                     # 联合适应
-```
-
-### 7.3 从哪里学
-
-| 资源 | 链接 | 重点 |
-|------|------|------|
-| 📄 必读 | [QLoRA (NeurIPS 2023)](https://arxiv.org/abs/2305.14314) | NF4 + Double Quantization |
-| 📄 必读 | [LLM-QAT (ICLR 2024)](https://arxiv.org/abs/2305.17888) | Data-free KD for QAT |
-| 📄 | [EfficientQAT (2024)](https://arxiv.org/abs/2407.11062) | 两阶段 QAT |
-| 📄 | [BitDistiller (2024)](https://arxiv.org/abs/2402.12231) | 蒸馏 + 量化联合 |
-| 📖 教程 | [HuggingFace QLoRA Tutorial](https://huggingface.co/blog/4bit-transformers-bitsandbytes) | 手把手 QLoRA |
-| 🛠 代码 | [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | NF4 实现 |
-
-### 7.4 检验标准
-
-- [ ] 用 QLoRA 微调一个 7B 模型，理解 NF4 的量化表
-- [ ] 能解释 double quantization：对 scale 的 scale 做量化
-- [ ] 对比 LLM-QAT（KD）和不带 KD 的 QAT 在 7B 模型上的 PPL
-- [ ] 理解为什么 EfficientQAT 要分两阶段
+- [ ] 用 QLoRA 微调 7B 模型，能画出 NF4 的 16 级量化表
+- [ ] 能解释 double quantization 为什么能省 0.4 bit/param
+- [ ] 手写 KD+QAT 的联合 loss，解释温度 T 的选择
+- [ ] 对比 QLoRA / LLM-QAT / EfficientQAT 的 PPL + 训练时间
 
 ---
 
 ## 阶段 8：端侧部署全链路 — 从量化模型到芯片推理
 
-> ⏱ 预计时间：2-3 周 | 🎯 难度：⭐⭐⭐⭐
+> ⏱ 预计时间：3-4 周 | 🎯 难度：⭐⭐⭐⭐
+>
+> 量化做完了，怎么部署？这一阶段打通 **PyTorch → ONNX → 推理引擎 → 芯片** 的全链路。
+> **核心主题**：一张计算图上哪些张量该量化、QDQ 节点如何插入和优化、各后端如何消费量化图。
+>
+> 这一章不是你之前学到的东西的"附录"——它回答了一个 Stage 0~7 没有系统回答的问题：
+> **"在一张完整的计算图上，权重、激活值、Bias、残差分支、Concat 的输入——到底哪些需要 QDQ 节点？哪些不需要？"**
 
-量化做完了，怎么部署？这个阶段打通**模型 → 芯片**的全链路。你已经了解 ONNX 图优化，这里做更深。
+### 8.1 细粒度学习路径
 
-### 8.1 你需要吃透什么
+```
+Week 1: 计算图量化全景——哪些张量该量化，哪些不该
+  ├── 子路径 1.1: 图中四类数据流
+  │     ├── 知识点: 权重（静态，推理时不变）→ 离线量化，一次完成
+  │     ├── 知识点: 激活值（动态，每张图不同）→ 在线量化，每层输入输出
+  │     ├── 知识点: Bias（量级小，精度敏感）→ 通常保持 FP32
+  │     ├── 知识点: 残差分支/Concat 输入 → 多源输入的 scale 需要对齐
+  │     └── 动手: 在 ResNet50 的 ONNX 图上手动标注哪些位置需要 QDQ
+  │
+  ├── 子路径 1.2: QDQ 插入的"黄金法则"
+  │     ├── 知识点: 每个 weight tensor 前必须有 DQ（反量化 weight → FP）
+  │     ├── 知识点: 每个 INT8 op 的输出后必须有 Q（量化输出 → INT8）
+  │     ├── 知识点: 不支持 INT8 的 op（如 Sigmoid、Reshape）前后插 DQ→Q
+  │     ├── 知识点: 相邻 Q→DQ 对可以消除（scale 相同时互相抵消）
+  │     └── 动手: 在 PPQ/PyTorch 中打印 QDQ 插入前后的图结构
+  │
+  ├── 子路径 1.3: 多输入 op 的 scale 对齐问题
+  │     ├── 知识点: Add/Concat 的两个输入必须量化到相同的 scale
+  │     ├── 知识点: 否则需要插入 Rescale 节点（额外开销）
+  │     ├── 知识点: 残差连接是 Add 量化的最大挑战
+  │     └── 动手: MobileNetV2 的残差块——分析 shortcut 和主分支 scale 对齐
+  │
+  └── 子路径 1.4: 第一层和最后一层的特殊处理
+        ├── 知识点: 第一层 Conv 处理原始像素/embedding → 量化噪声最敏感
+        ├── 知识点: 最后一层输出 softmax logits → 精度直接影响预测
+        ├── 知识点: 常见策略——首尾层保持 FP32，中间层 INT8
+        └── 动手: 对比"全量化"vs"首尾 FP32"在 MobileNet 上的精度差异
 
-| # | 知识点 | 深度要求 |
-|---|--------|----------|
-| 1 | **ONNX QDQ 格式**：QuantizeLinear / DequantizeLinear 节点在 ONNX 图中的语义 | 能手写一个带 QDQ 节点的 ONNX graph |
-| 2 | **图优化 Pass**：Fuse QDQ + Conv、Remove Duplicate DQ 等 | 能写出 3 个常用的 QDQ 优化 Pass |
-| 3 | **TensorRT INT8 推理**：Builder Config 中 INT8 flag 的含义 | 理解 calibration cache 与 QAT 模型的区别 |
-| 4 | **高通 QAIRT → DLC** 链路：ONNX + encodings → DLC | 理解 encodings 文件的作用 |
-| 5 | **ExecuTorch**：PyTorch 官方的端侧推理运行时 | 知道 delegate 的概念 |
-| 6 | **量化推理精度 debug**：Numeric Suite / Layer-wise Error Analysis | 能快速定位哪一层的量化误差最大 |
-| 7 | **Per-layer vs Per-channel 的硬件支持**：知道哪些硬件支持哪些粒度 | 理解为什么某些硬件不能 per-channel |
+Week 2: ONNX QDQ —— 量化图的通用语言
+  ├── 子路径 2.1: QDQ 节点语义
+  │     ├── 知识点: QuantizeLinear(FP32→INT8) / DequantizeLinear(INT8→FP32)
+  │     ├── 知识点: QDQ 的 scale/zero_point 存在 node attributes 中
+  │     ├── 知识点: opset 13 引入 QDQ, opset 17 稳定
+  │     └── 动手: 手写一个带 QDQ 节点的 ONNX graph（用 onnx.helper）
+  │
+  ├── 子路径 2.2: 从 PyTorch QAT 模型导出 QDQ
+  │     ├── 知识点: torch.onnx.export(model_int8, ...) → 自动生成 QDQ
+  │     ├── 知识点: convert_fx 后的模型已经包含 QDQ 信息
+  │     ├── 坑: QAT 模型必须先 convert_fx 再 export，不能直接从 prepared 模型导出
+  │     └── 动手: 导出 ResNet18 QAT → ONNX QDQ → Netron 可视化
+  │
+  ├── 子路径 2.3: ONNX 图优化 Pass
+  │     ├── 知识点: DQ+Conv+Q 融合 → INT8 Conv（省两次数据转换）
+  │     ├── 知识点: 冗余 QDQ 消除 → 相邻 Q→DQ（同 scale）→ Identity
+  │     ├── 知识点: DQ 上浮 → 将 DQ 推到图的最前端（减少中间量化）
+  │     ├── 动手: 写 onnx-simplifier pass 融合 DQ+Conv+Q
+  │     └── 动手: 对比优化前后的 QDQ 节点数量和推理延迟
+  │
+  └── 子路径 2.4: ONNX Runtime INT8 推理
+        ├── 知识点: ORT 的 INT8 EP（Execution Provider）如何消费 QDQ
+        ├── 动手: ORT INT8 vs FP32 延迟对比
+        └── 坑: ORT INT8 要求 per-channel 量化的 weight 满足特定形状对齐
 
-### 8.2 怎么做
+Week 3: 后端部署 —— TensorRT / OpenVINO / QAIRT 三条路
+  ├── 子路径 3.1: TensorRT INT8
+  │     ├── 知识点: QAT 模型→ONNX QDQ→TRT INT8 engine（直接使用 QDQ scale）
+  │     ├── 知识点: PTQ 模型→ONNX FP32→TRT calibrator（TRT 自行校准）
+  │     ├── 知识点: INT8 Tensor Core vs FP16 Tensor Core 的吞吐差异
+  │     ├── 动手: 构建 YOLOv8 QAT INT8 engine → 测 batch 1/4/8 延迟
+  │     └── 坑: 某些层 TRT 可能 fallback 到 FP16（看 builder log）
+  │
+  ├── 子路径 3.2: OpenVINO INT8 (Intel CPU/GPU)
+  │     ├── 知识点: OpenVINO 的 POT (Post-training Optimization Tool)
+  │     ├── 知识点: AccuracyAwareQuantization——自动搜索最优混合精度
+  │     └── 动手: 用 NNCF 对 MobileNet 做 QAT → OpenVINO IR → CPU 推理
+  │
+  ├── 子路径 3.3: 高通 QAIRT → DLC (骁龙芯片)
+  │     ├── 知识点: AIMET QuantSim → Export ONNX + .encodings
+  │     ├── 知识点: QAIRT Converter → DLC（Deep Learning Container）
+  │     ├── 知识点: 骁龙 NPU 的量化约束（per-tensor 优先、不支持某些 op）
+  │     └── 动手: ResNet18 QAT → AIMET Export → QAIRT → DLC → 骁龙模拟器推理
+  │
+  └── 子路径 3.4: llama.cpp GGUF (LLM CPU 推理)
+        ├── 知识点: GGUF 格式：Q4_K_M / Q5_K_M / Q8_0 等量化类型
+        ├── 知识点: K-quant 的含义——关键层（attention）用更高比特
+        ├── 知识点: imatrix 校准——用校准数据找到各层的最佳量化参数
+        └── 动手: LLaMA-7B → GGUF Q4_K_M → CPU 推理，测 tok/s
 
-#### 8.2a：导出 ONNX QDQ 并做图优化
-
-```python
-# ========== ONNX QDQ 导出 + 图优化 ==========
-import onnx
-from onnx import helper, numpy_helper
-
-# Step 1: 从 PyTorch QAT 模型导出 ONNX（带 QDQ）
-torch.onnx.export(
-    model_int8,
-    example_inputs,
-    "model_int8_qdq.onnx",
-    opset_version=17,          # QDQ 支持从 opset 13 开始
-    input_names=["input"],
-    output_names=["output"],
-)
-
-# Step 2: 加载并检查 ONNX 图
-model_onnx = onnx.load("model_int8_qdq.onnx")
-for node in model_onnx.graph.node:
-    if node.op_type in ["QuantizeLinear", "DequantizeLinear"]:
-        print(f"  [{node.op_type}] {node.name}: {node.input[0]}")
-
-# Step 3: 分析 QDQ 节点插入位置
-# 期望的 pattern: DQ → Conv → Q → DQ → Conv → Q → ...
-# 优化目标: DQ + Conv + Q 融合为 INT8 Conv
+Week 4: 端到端实战 + 性能 Tuning
+  ├── 子路径 4.1: YOLOv8 全链路
+  │     ├── PyTorch QAT → ONNX QDQ → TRT INT8
+  │     ├── 画 PyTorch→ONNX→Engine 的完整数据流图
+  │     ├── FP16 vs INT8 延迟 + mAP 对比
+  │     └── 分析：哪些层的 QDQ 被 TRT 融合了，哪些没被融合
+  │
+  ├── 子路径 4.2: 量化精度 Debug 工具链
+  │     ├── PyTorch Numeric Suite: compare_weights / compare_outputs
+  │     ├── ONNX Runtime Profiling: 逐层延迟 + 输出统计
+  │     ├── TRT Inspector: 检查 engine 中各层的精度和格式
+  │     └── 动手: 用 Numeric Suite 对比 QAT 前后的每层输出分布
+  │
+  └── 子路径 4.3: 混合精度部署策略
+        ├── 知识点: 哪些层需要退回到 FP16（精度敏感层）
+        ├── 动手: 用逐层误差分析输出前 5 敏感层 → 设为 FP16 → 重测精度
+        └── 总结: "全 INT8"vs"混合精度"的精度/速度 Pareto frontier
 ```
 
-#### 8.2b：TensorRT INT8 推理
+### 8.2 关键参考
 
-```python
-# ========== TensorRT INT8 推理（带 QAT 模型） ==========
-import tensorrt as trt
-import pycuda.driver as cuda
-
-# 方案 A: 使用 QAT 模型的 scale（更精确）
-# 导出 ONNX QDQ → TensorRT 直接使用 QDQ 中记录的 scale
-
-# 方案 B: TensorRT 自己做校准（不用 QAT 时）
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-builder = trt.Builder(TRT_LOGGER)
-network = builder.create_network(
-    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-)
-parser = trt.OnnxParser(network, TRT_LOGGER)
-parser.parse(onnx_model.SerializeToString())
-
-config = builder.create_builder_config()
-config.set_flag(trt.BuilderFlag.INT8)
-# 关键：设置校准器（如果 ONNX 没有 QDQ）
-# config.int8_calibrator = MyCalibrator(calib_data_loader)
-
-engine = builder.build_serialized_network(network, config)
-```
-
-#### 8.2c：量化精度 Debug — Layer-wise Error Analysis
-
-```python
-# ========== 逐层误差分析 ==========
-import torch
-from torch.ao.quantization import NumericSuite
-
-def layerwise_error_analysis(model_fp, model_q, dataloader):
-    """定位哪些层量化误差最大"""
-    errors = {}
-
-    for name, module_fp in model_fp.named_modules():
-        if isinstance(module_fp, (torch.nn.Conv2d, torch.nn.Linear)):
-            module_q = dict(model_q.named_modules())[name]
-
-            # 收集该层的输入输出
-            error_sum = 0.0
-            count = 0
-            for batch in dataloader:
-                with torch.no_grad():
-                    out_fp = module_fp(batch)
-                    out_q = module_q(batch)
-                    # 相对误差
-                    error = ((out_fp - out_q) ** 2).mean() / (out_fp ** 2).mean()
-                    error_sum += error.item()
-                    count += 1
-
-            errors[name] = error_sum / count
-
-    # 排序，定位误差最大的前 10 层
-    sorted_errors = sorted(errors.items(), key=lambda x: x[1], reverse=True)
-    print("=== Top 10 layers with largest quantization error ===")
-    for name, err in sorted_errors[:10]:
-        print(f"  {name}: {err:.6f}")
-
-    return errors
-```
-
-### 8.3 从哪里学
-
-| 资源 | 链接 |
+| 资源 | 重点 |
 |------|------|
-| 📖 官方 | [ONNX QDQ Documentation](https://onnx.ai/onnx/operators/) |
-| 📖 官方 | [TensorRT INT8 Inference](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#int8-inference) |
-| 📖 官方 | [AIMET → QAIRT 部署](https://quic.github.io/aimet-pages/releases/2.0.0/userguide/quantization_workflow.html) |
-| 📖 官方 | [ExecuTorch Quantization](https://pytorch.org/executorch/stable/tutorials/quantization-tutorial.html) |
-| 📖 教程 | [ONNX Runtime INT8](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html) |
-| 🛠 工具 | [Netron](https://netron.app/) — ONNX 图可视化 |
+| 📖 [ONNX QDQ 官方文档](https://onnx.ai/onnx/operators/) | Q/DQ 节点语义和 opset 版本差异 |
+| 📖 [TensorRT INT8 Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#int8-inference) | QAT vs PTQ 两种 INT8 路径 |
+| 📖 [AIMET Export to QAIRT](https://quic.github.io/aimet-pages/) | 高通端到端部署流程 |
+| 📖 [ExecuTorch Quantization](https://pytorch.org/executorch/stable/) | PyTorch 官方端侧推理方案 |
+| 🛠 [Netron](https://netron.app/) | ONNX 图可视化，观察 QDQ 节点 |
+| 🛠 [Polygraphy](https://github.com/NVIDIA/TensorRT/tree/main/tools/Polygraphy) | TRT engine 检查和 debug |
 
-### 8.4 检验标准
+### 8.3 检验标准
 
-- [ ] 从 YOLO QAT 模型导出 ONNX QDQ，用 Netron 可视化 QDQ 节点
-- [ ] 用 TensorRT builder 构建 INT8 引擎，对比 FP16 vs INT8 的延迟
-- [ ] 写一个简单的 ONNX graph pass：融合相邻的 DQ + Conv + Q
-- [ ] 画出从 PyTorch → ONNX QDQ → TensorRT 引擎的完整数据流图
+- [ ] 能手动画出一张计算图，标注哪些位置需要 QDQ、哪些不需要
+- [ ] 能解释 Add/Concat 的 scale 对齐问题及解决方案
+- [ ] 从 YOLO QAT 模型导出 ONNX QDQ，用 Netron 检查 QDQ 节点
+- [ ] 写一个 ONNX pass 融合 DQ+Conv+Q
+- [ ] 构建 TRT INT8 engine 并对比 FP16 vs INT8 延迟
+- [ ] 能用逐层误差分析定位量化瓶颈层
+- [ ] 画出 PyTorch → ONNX QDQ → TRT/QAIRT 的完整数据流图
 
 ---
 
@@ -1503,7 +1413,34 @@ def layerwise_error_analysis(model_fp, model_q, dataloader):
 
 > ⏱ 预计时间：持续关注 | 🎯 难度：⭐⭐⭐⭐⭐
 
-你已经在主路上走得很深了。这一阶段的内容是前沿方向，不需要全部吃透，但要知道它们的存在、解决什么问题、和你的工作有什么关系。
+你已经在主路上走得很深了。这一阶段不是"学完"，而是"持续追踪"——知道每个前沿方向的核心问题、代表性工作和与你的知识体系的关系。建议每月读 1-2 篇前沿论文保持手感。
+
+### 9.1 七个方向的"一句话 + 论文 + 你的切入点"
+
+| 方向 | 一句话 | 关键论文 | 和已学知识的连接点 |
+|------|--------|----------|-------------------|
+| **FP8 量化** | E4M3/E5M2 格式,H100 硬件支持 | [FP8 Formats (2022)](https://arxiv.org/abs/2209.05433) | Stage 0 浮点位布局 → FP8 的 1+4+3 位 |
+| **KV Cache 量化** | 128K context 的 KV Cache 可能比模型本身还大 | [KVQuant (2024)](https://arxiv.org/abs/2401.18079) | Stage 6 SmoothQuant → 类似思想用于 KV |
+| **BitNet b1.58** | 权重三值化(-1,0,+1),用加法替代乘法 | [BitNet b1.58 (2024)](https://arxiv.org/abs/2402.17764) | Stage 2 LSQ → 极致版量化 |
+| **MoE 量化** | Expert 路由不均衡 → 热门 expert 对量化更敏感 | [MC-MoE (2024)](https://arxiv.org/abs/2405.06411) | Stage 6 Outlier → MoE 路由也是 heavy-tailed |
+| **Diffusion 量化** | 100 步迭代去噪 → 单步误差累积放大 | [Q-Diffusion (ICCV 2023)](https://arxiv.org/abs/2302.04304) | Stage 3 AdaRound → 可适配多步特性 |
+| **MX 格式** | OCP 标准块浮点——一组值共享 exponent | [MX Spec v1.0 (2023)](https://www.opencompute.org/) | Stage 0 per-group → MX 是硬件标准化版 |
+| **FP4 训练** | Blackwell 原生 FP4 Tensor Core | [Blackwell (2024)](https://nvda.ws/3XkYF5j) | Stage 2 LSQ → FP4 训练需更强梯度保护 |
+
+### 9.2 追踪策略
+
+```
+每月 1-2 篇 → 读后写 200 字总结 → 标注"和 Stage X 的连接"
+每季度深入一个方向，不要同时追 7 个
+```
+
+### 9.3 推荐追踪源
+
+| 类型 | 资源 |
+|------|------|
+| Survey | [Low-Bit LLMs Survey (2025)](https://arxiv.org/abs/2501.12345) |
+| Awesome | [Awesome Low-Precision Training](https://github.com/Hao840/Awesome-Low-Precision-Training) |
+| 每日 | [HuggingFace Daily Papers](https://huggingface.co/papers) |
 
 ### 9.1 前沿方向清单
 
