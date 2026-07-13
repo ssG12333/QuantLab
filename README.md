@@ -7,7 +7,7 @@
 > ***🔥 Ongoing: from low-level math to production deployment, one bit at a time.***
 
 [![Stages](https://img.shields.io/badge/stages-9-blue)](QAT_LEARNING_ROADMAP.md)
-[![Docs](https://img.shields.io/badge/docs-2篇_articles-green)](docs/)
+[![Notebooks](https://img.shields.io/badge/notebooks-4篇-green)](notebooks/)
 [![Status](https://img.shields.io/badge/status-持续更新_ongoing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
@@ -33,10 +33,12 @@
 
 | 你想... / You want to... | 从这里开始 / Start here |
 |---|---|
-| 了解全局路线 / See the big picture | [9 阶段学习路线图 / Roadmap](QAT_LEARNING_ROADMAP.md) |
-| 建立量化直觉 + 啃 PyTorch 源码 | [📖 Stage 0：量化基础与硬件基石](docs/Stage0_量化基础与硬件基石.md) |
-| 搞懂 PyTorch QAT 三种模式 | [📖 Stage 1：PyTorch 原生 QAT](docs/Stage1_PyTorch原生QAT三种模式.md) |
-| 查已拆解的 PyTorch 模块源码 | [🔍 源码分析索引](source-notes/README.md) |
+| 了解全局路线 | [9 阶段路线图](QAT_LEARNING_ROADMAP.md) |
+| 建立量化直觉 + 啃 PyTorch 源码 | [📓 Stage 0：量化基础](notebooks/Stage0_量化基础与硬件基石.ipynb) |
+| 搞懂 PyTorch QAT 三种模式 | [📓 Stage 1：PyTorch QAT 全景](notebooks/Stage1_PyTorch原生QAT三种模式.ipynb) |
+| QAT 训练深度剖析 | [📓 Stage 1.5：QAT 训练深剖](notebooks/Stage1.5_QAT训练深度剖析.ipynb) |
+| 学 LSQ 核心算法 | [📓 Stage 2：LSQ](notebooks/Stage2_LSQ与可微量化参数.ipynb) |
+| 查 PyTorch 源码拆解笔记 | [🔍 源码分析](source-notes/README.md) |
 | 跑独立可运行代码 | [💻 代码实现](code/README.md) |
 | 读论文笔记 | [📝 论文笔记](paper-notes/README.md) |
 
@@ -83,18 +85,18 @@ QuantLab/
 ├── README.md                              ← 你在这里 / You are here
 ├── QAT_LEARNING_ROADMAP.md                ← 9 阶段完整路线图
 │
-├── 📖 docs/                               ← 学习文档（理论 + 源码深潜 + 实验）
-│   ├── Stage0_量化基础与硬件基石.md          ✅ 浮点位布局 → 量化公式 → 四种校准器
-│   │                                         → Observer/FakeQuantize/Stubs 源码
-│   ├── Stage1_PyTorch原生QAT三种模式.md      ✅ Eager → FX → PT2E + 图改写源码
-│   ├── Stage2_LSQ与可微量化参数.md           🔜 LSQ 从零实现 + 梯度推导
-│   ├── Stage3_PTQ进阶算法.md                 📋 AdaRound → FlexRound → GPTQ
-│   ├── Stage4_YOLO量化实战.md                📋 PTQ vs QAT vs LSQ 消融实验
-│   ├── Stage5_工业级框架.md                  📋 PPQ (商汤) + AIMET (高通)
-│   ├── Stage6_大模型PTQ.md                   📋 GPTQ/AWQ/SmoothQuant/SpinQuant
-│   ├── Stage7_大模型QAT.md                   📋 QLoRA/LLM-QAT/EfficientQAT
-│   ├── Stage8_端侧部署全链路.md              📋 ONNX → TensorRT → QAIRT/DLC
-│   └── Stage9_前沿追踪.md                   🔄 FP8/KV Cache/BitNet/MoE
+├── 📓 notebooks/                           ← Jupyter Notebook 学习文档
+│   ├── Stage0_量化基础与硬件基石.ipynb        ✅ 纯理论地基
+│   ├── Stage1_PyTorch原生QAT三种模式.ipynb    ✅ PyTorch 量化全景
+│   ├── Stage1.5_QAT训练深度剖析.ipynb        ✅ 手写→消融→崩溃→引出LSQ
+│   ├── Stage2_LSQ与可微量化参数.ipynb        ✅ LSQ 自然延伸
+│   ├── Stage3_PTQ进阶算法.ipynb              📋 AdaRound → FlexRound → GPTQ
+│   ├── Stage4_YOLO量化实战.ipynb             📋 PTQ vs QAT vs LSQ 消融实验
+│   ├── Stage5_工业级框架.ipynb               📋 PPQ + AIMET
+│   ├── Stage6_大模型PTQ.ipynb                📋 GPTQ/AWQ/SmoothQuant/SpinQuant
+│   ├── Stage7_大模型QAT.ipynb                📋 QLoRA/LLM-QAT/EfficientQAT
+│   ├── Stage8_端侧部署全链路.ipynb           📋 ONNX → TensorRT → QAIRT/DLC
+│   └── Stage9_前沿追踪.ipynb                🔄 FP8/KV Cache/BitNet/MoE
 │
 ├── 🔍 source-notes/                       ← PyTorch 源码拆解笔记
 ├── 💻 code/                               ← 独立可运行代码
@@ -136,9 +138,10 @@ QuantLab/
 
 | 阶段 / Stage | 状态 | 完成日 |
 |------|:--:|--------|
-| Stage 0 · 量化基础 + PyTorch 源码 | ✅ | 2026-07-10 |
-| Stage 1 · PyTorch QAT 三种模式 | ✅ | 2026-07-10 |
-| Stage 2 · LSQ 核心算法 | 🔜 | — |
+| Stage 0 · 量化基础（纯理论） | ✅ | 2026-07-10 |
+| Stage 1 · PyTorch 量化全景 | ✅ | 2026-07-13 |
+| Stage 1.5 · QAT 训练深度剖析 | ✅ | 2026-07-13 |
+| Stage 2 · LSQ 核心算法 | ✅ | 2026-07-13 |
 | Stage 3 · PTQ 进阶算法 | 📋 | — |
 | Stage 4 · YOLO 量化实战 | 📋 | — |
 | Stage 5 · PPQ + AIMET | 📋 | — |
