@@ -1,0 +1,639 @@
+# Stage 1: PyTorch 量化全景 — API 设计 + 源码深潜
+
+> ⏱ 预计学习时间：20-30 小时 | 🎯 难度：⭐⭐
+>
+> **目标**：**一次性吃透 PyTorch 量化的全部机制**——Observer 如何观察数据、FakeQuantize 状态机如何驱动 QAT、QuantStub 的生命周期、fuse_modules 内部流程、prepare_qat_fx 如何改写计算图、以及 Eager / FX / PT2E 三种 API 模式的完整对比。学完后你能看着 PyTorch 源码自信地说"我知道这一行在做什么"。
+
+---
+
+## 目录
+
+1. [开篇：从 Stage 0 到 Stage 1——从数学到工程](#开篇)
+2. [知识总览](#知识总览)
+3. [1. Observer 家族：量化参数的"传感器"](#1-observer-家族量化参数的传感器)
+4. [2. FakeQuantize 状态机：QAT 的核心引擎](#2-fakequantize-状态机qat-的核心引擎)
+5. [3. QuantStub / DeQuantStub：量化图的"门"](#3-quantstub--dequantstub量化图的门)
+6. [4. fuse_modules：Conv+BN 融合的内部全流程](#4-fuse_modulesconvbn-融合的内部全流程)
+7. [5. Eager Mode QAT：最直观的模式](#5-eager-mode-qat最直观的模式)
+8. [6. FX Graph Mode QAT：图改写的力量](#6-fx-graph-mode-qat图改写的力量)
+9. [7. PT2E QAT：为 export 而生的新标准](#7-pt2e-qat为-export-而生的新标准)
+10. [8. QConfigMapping：按层定制量化策略](#8-qconfigmapping按层定制量化策略)
+11. [9. 源码汇总：prepare_qat_fx 和 convert_fx 全流程](#9-源码汇总prepare_qat_fx-和-convert_fx-全流程)
+12. [10. QAT 训练实战技巧](#10-qat-训练实战技巧)
+13. [11. 动手实验](#11-动手实验)
+14. [检验标准](#检验标准)
+
+---
+
+## 开篇：从 Stage 0 到 Stage 1——从数学到工程
+
+Stage 0 讲的是"量化是什么"——浮点数怎么变整数、scale 怎么算、硬件怎么加速。你手写了一个 `QuantizedLinear` 类，里面只有 `round(x/S)*S` 这一行量化逻辑。那是 100 行的玩具代码。
+
+但 PyTorch 的量化模块有上万行——`observer.py`、`fake_quantize.py`、`stubs.py`、`fuse_modules.py`、`quantize_fx.py`、`convert.py`。它们做的是同一件事（量化），但设计了大量抽象层来适配不同的硬件后端、不同的精度需求、不同的调试场景。
+
+这一章就带你逐文件拆解这些抽象层——不是让你死记 API 参数，而是理解**PyTorch 为什么这样设计**。读完这章，你看着 `prepare_qat_fx` 的源码能说出"哦，这一步是在图中的 Conv 后面插入一个 Observer 节点"——而不只是"这是个黑箱函数"。
+
+---
+
+## 知识总览
+
+```
+PyTorch 量化的六层抽象（从底层到高层）:
+
+┌──────────────────────────────────────────┐
+│ [6] prepare_qat_fx / convert_fx          │  ← 组装所有模块的"总调度"
+├──────────────────────────────────────────┤
+│ [5] Eager / FX / PT2E 三种 API 模式      │  ← 用户调用入口
+├──────────────────────────────────────────┤
+│ [4] QConfigMapping + BackendConfig        │  ← 策略配置层
+├──────────────────────────────────────────┤
+│ [3] fuse_modules (Conv+BN 融合)           │  ← 图预处理
+├──────────────────────────────────────────┤
+│ [2] FakeQuantize (observer + 量化模拟)    │  ← QAT 核心引擎
+├──────────────────────────────────────────┤
+│ [1] Observer (MinMax/MovingAvg/Histogram) │  ← 统计收集
+└──────────────────────────────────────────┘
+
+本章的讲解顺序: 从底层到高层——先理解每个模块独立做什么,
+再把它们串起来看 prepare_qat_fx 如何调度一切。
+```
+
+---
+
+## 1. Observer 家族：量化参数的"传感器"
+
+> 源码位置: `torch/ao/quantization/observer.py`
+
+Observer 是量化流程的起点。它的职责很简单：**观察经过它的张量，记录 min 和 max，据此算出 scale 和 zero_point。** Observer 本身不修改数据——它只是"看"。
+
+### 1.1 继承树
+
+```
+ObserverBase (nn.Module)
+  └── _ObserverBase (添加 eps、dtype、qscheme 等量化属性)
+        ├── MinMaxObserver (直接记录 min/max)
+        │     ├── MovingAverageMinMaxObserver (EMA 更新)
+        │     │     └── MovingAveragePerChannelMinMaxObserver
+        │     └── PerChannelMinMaxObserver (per-channel, 无 EMA)
+        └── HistogramObserver (用直方图做 KL/MSE 校准)
+```
+
+**为什么这么分层？**
+- `ObserverBase`：提供 `calculate_qparams()` 接口——所有子类都要实现
+- `_ObserverBase`：添加 `eps`、`dtype`、`qscheme`、`quant_min/quant_max` 等通用属性
+- 叶节点（MinMax / Histogram / PerChannel）：各自的 `forward()` 实现不同的 min/max 收集策略
+
+### 1.2 MinMaxObserver：最简实现
+
+```python
+# ===== MinMaxObserver 的简化源码 =====
+import torch, torch.nn as nn
+
+class MinMaxObserver(nn.Module):
+    """
+    核心状态: min_val / max_val 两个 buffer
+    核心逻辑: forward 时更新 min/max, 返回原始输入（不修改数据）
+
+    设计要点:
+    1. 继承 nn.Module → 可作为子模块注册到模型中
+    2. min_val/max_val 用 register_buffer → 跟随 model.to(device), 保存到 state_dict
+    3. forward 只"看"数据不修改 → 返回原始输入
+    """
+    def __init__(self, dtype=torch.quint8, qscheme=torch.per_tensor_affine,
+                 quant_min=0, quant_max=255, eps=torch.finfo(torch.float32).eps):
+        super().__init__()
+        self.dtype, self.qscheme = dtype, qscheme
+        self.quant_min, self.quant_max = quant_min, quant_max
+        self.eps = eps  # 防止 scale=0 导致除零
+
+        # register_buffer: 不是可训练参数, 但跟着 device 迁移 + state_dict
+        self.register_buffer("min_val", torch.tensor(float("inf")))
+        self.register_buffer("max_val", torch.tensor(float("-inf")))
+
+    def forward(self, x_orig):
+        if x_orig.numel() == 0: return x_orig
+        x = x_orig.detach()  # detach: 不让 min/max 更新参与梯度计算
+
+        if self.qscheme in (torch.per_tensor_affine, torch.per_tensor_symmetric):
+            self.min_val = torch.min(self.min_val, x.min())
+            self.max_val = torch.max(self.max_val, x.max())
+        elif self.qscheme in (torch.per_channel_affine, torch.per_channel_symmetric):
+            # per-channel: channel 是第 0 维, 沿其余维度取 min/max
+            x_flat = x.reshape(x.shape[0], -1)
+            self.min_val = torch.min(self.min_val, x_flat.min(dim=1).values)
+            self.max_val = torch.max(self.max_val, x_flat.max(dim=1).values)
+        return x_orig  # ← 注意：返回原始输入！
+
+    def calculate_qparams(self):
+        if self.qscheme in (torch.per_tensor_symmetric, torch.per_channel_symmetric):
+            abs_max = torch.max(self.min_val.abs(), self.max_val.abs())
+            scale = abs_max / float(self.quant_max - self.quant_min) * 2
+            zero_point = torch.zeros_like(scale)
+        else:
+            scale = (self.max_val - self.min_val) / float(self.quant_max - self.quant_min)
+            zero_point = self.quant_min - torch.round(self.min_val / scale)
+            zero_point = torch.clamp(zero_point, self.quant_min, self.quant_max)
+        return scale, zero_point
+```
+
+### 1.3 MovingAverageMinMaxObserver：EMA 平滑版
+
+```python
+class MovingAverageMinMaxObserver(MinMaxObserver):
+    """
+    为什么需要 EMA？
+
+    直接取整个 epoch 的 abs min/max → 被一个异常 batch 污染。
+    EMA (Exponential Moving Average) 给最近的 batch 更大权重:
+
+      new = old + α × (observed - old)
+
+    当 α=0.01 时, 最近 100 个 batch 的权重占 ~63%。
+    """
+    def __init__(self, averaging_constant=0.01, **kwargs):
+        super().__init__(**kwargs)
+        self.averaging_constant = averaging_constant
+
+    def forward(self, x_orig):
+        if x_orig.numel() == 0: return x_orig
+        x = x_orig.detach()
+        if self.qscheme in (torch.per_tensor_affine, torch.per_tensor_symmetric):
+            self.min_val += self.averaging_constant * (x.min() - self.min_val)
+            self.max_val += self.averaging_constant * (x.max() - self.max_val)
+        return x_orig
+```
+
+### 1.4 HistogramObserver：直方图搜索版
+
+```python
+class HistogramObserver(MinMaxObserver):
+    """
+    不用 min/max, 而是构建直方图做 KL/MSE 搜索最优截断点。
+    TensorRT 的默认校准方法背后的机制。
+    """
+    def __init__(self, bins=2048, **kwargs):
+        super().__init__(**kwargs)
+        self.bins = bins
+        self.register_buffer("histogram", torch.zeros(self.bins))
+
+    def forward(self, x_orig):
+        if x_orig.numel() == 0: return x_orig
+        x = x_orig.detach().abs()
+        super().forward(x)  # 更新 min/max（用于确定直方图范围）
+        new_hist = torch.histc(x, bins=self.bins,
+                               min=self.min_val.item(), max=self.max_val.item())
+        self.histogram += new_hist  # 累积直方图
+        return x_orig
+
+    def calculate_qparams(self):
+        # 用累积直方图做 KL/MSE 搜索（见 Stage 0 的 KLCalibrator）
+        new_min, new_max = _non_linear_param_search(self.histogram, ...)
+        self.min_val, self.max_val = new_min, new_max
+        return super().calculate_qparams()
+```
+
+### 1.5 Observer 选择速查表
+
+| Observer | min/max 来源 | 适用场景 |
+|----------|------------|----------|
+| `MinMaxObserver` | 直接取 min/max, 无平滑 | 快速实验, outlier 少的网络 |
+| `MovingAverageMinMaxObserver` | EMA 平滑 min/max | **PyTorch 默认**, 通用 |
+| `PerChannelMinMaxObserver` | 每个输出通道独立 | **权重量化默认** |
+| `HistogramObserver` | 直方图 KL/MSE 搜索 | TensorRT 后端, 激活量化 |
+| `MovingAveragePerChannelMinMaxObserver` | EMA + per-channel | 权重量化的稳健选择 |
+
+---
+
+## 2. FakeQuantize 状态机：QAT 的核心引擎
+
+> 源码位置: `torch/ao/quantization/fake_quantize.py`
+
+FakeQuantize 继承自 Observer，额外加了**量化模拟**功能。它用一个双开关状态机来驱动 QAT 的三个阶段。
+
+### 2.1 继承关系
+
+```
+FakeQuantizeBase (nn.Module)
+  └── FakeQuantize ←── 多继承:
+        ├── FakeQuantizeBase 的状态管理 (observer_enabled / fake_quant_enabled)
+        └── MovingAverageMinMaxObserver 的统计能力 (min_val / max_val / calculate_qparams)
+```
+
+### 2.2 双开关状态机——理解 QAT 训练节奏的关键
+
+```python
+class FakeQuantizeBase(nn.Module):
+    """两个独立开关: 为什么不用一个 mode 枚举？"""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('fake_quant_enabled', torch.tensor([1], dtype=torch.uint8))
+        self.register_buffer('observer_enabled', torch.tensor([1], dtype=torch.uint8))
+        # 用 uint8 tensor 而非 bool: TorchScript 兼容性
+
+    def enable_observer(self):   self.observer_enabled[0] = 1
+    def disable_observer(self):  self.observer_enabled[0] = 0
+    def enable_fake_quant(self):  self.fake_quant_enabled[0] = 1
+    def disable_fake_quant(self): self.fake_quant_enabled[0] = 0
+```
+
+**QAT 三阶段对应**:
+
+```
+Phase 1 (Calibration, 前几个 epoch):
+  observer_enabled = True    → 正在收集 min/max, 更新 scale
+  fake_quant_enabled = True  → 正在做量化（让模型感受噪声）
+
+Phase 2 (QAT Training, 大部分 epoch):
+  observer_enabled = False   → scale 已冻结，不更新
+  fake_quant_enabled = True  → 持续做量化
+
+Phase 3 (Evaluation):
+  observer_enabled = False
+  fake_quant_enabled = True
+  model.eval()              → BN 切换到 running stats
+```
+
+**为什么用两个独立开关而不是一个 `mode` 枚举？** 因为真实场景中可能需要混合——某些层永不做量化（两者都关）、某些高级场景同时观察和量化（两者都开）。两个 flag 提供了最大灵活性。
+
+### 2.3 FakeQuantize.forward() 的完整逻辑
+
+```python
+class FakeQuantize(FakeQuantizeBase, MovingAverageMinMaxObserver):
+    def forward(self, X):
+        # 阶段 1: 观察（更新 scale）
+        if self.observer_enabled[0] == 1:
+            self.activation_post_process(X)  # 更新 min/max → 重新计算 scale
+
+        # 阶段 2: 量化-反量化
+        if self.fake_quant_enabled[0] == 1:
+            scale, zero_point = self.calculate_qparams()
+            # 调用 C++ 实现的核心操作（高效 + 已内嵌 STE）
+            if self.qscheme == torch.per_tensor_affine:
+                X = torch.fake_quantize_per_tensor_affine(
+                    X, scale.item(), int(zero_point.item()),
+                    self.quant_min, self.quant_max)
+            elif self.qscheme in (torch.per_channel_symmetric, torch.per_channel_affine):
+                X = torch.fake_quantize_per_channel_affine(
+                    X, scale, zero_point, self.quant_min, self.quant_max)
+        return X
+```
+
+**关于 `torch.fake_quantize_per_tensor_affine`**：这是 PyTorch 的 C++ 扩展函数。前向做 `round(x/s+z) → clamp → (x-z)*s`，反向用 STE 让梯度直穿 `round()`。和 Stage 0 手写的逻辑完全一样——只是用 C++ 实现了更高的效率。
+
+---
+
+## 3. QuantStub / DeQuantStub：量化图的"门"
+
+> 源码位置: `torch/ao/quantization/stubs.py`
+
+Stubs 的源码极其简单——它们本身不做任何计算：
+
+```python
+class QuantStub(nn.Module):
+    """标记"量化开始"位置的占位符。"""
+    def forward(self, x): return x  # 完全直通
+
+class DeQuantStub(nn.Module):
+    """标记"反量化结束"位置的占位符。"""
+    def forward(self, x): return x  # 完全直通
+```
+
+**它们的真正价值在 prepare_qat 和 convert 阶段体现**：
+
+```
+用户定义模型时:
+  self.quant = QuantStub()      ← 告诉框架: "从这里开始量化"
+  self.dequant = DeQuantStub()  ← 告诉框架: "到这里结束量化"
+
+prepare_qat() 阶段:
+  QuantStub → 被替换为 FakeQuantize (observer + fake_quant)
+
+convert() 阶段:
+  QuantStub → 被替换为 torch.nnq.Quantize (真正的量化节点)
+  DeQuantStub → 被替换为 torch.nnq.DeQuantize (真正的反量化节点)
+```
+
+**生命周期一览**：用户定义 (identity) → prepare_qat (FakeQuantize) → convert (Quantize/DeQuantize 节点)。
+
+---
+
+## 4. fuse_modules：Conv+BN 融合的内部全流程
+
+> 源码位置: `torch/ao/quantization/fuse_modules.py`
+
+### 4.1 fuse_modules 做了什么（一句话版）
+
+把 `['conv1', 'bn1', 'relu1']` 变成 `[ConvBnReLU2d, Identity, Identity]`——融合后的模块吃掉所有计算，原来的 bn1 和 relu1 被替换为占位符。
+
+### 4.2 完整六步流程
+
+```
+fuse_modules(model, [['conv1','bn1','relu1']])
+  │
+  ├── Step 1: 解析路径
+  │     _get_module(model, 'conv1') → Conv2d 对象
+  │     _get_module(model, 'bn1')   → BatchNorm2d 对象
+  │     _get_module(model, 'relu1') → ReLU 对象
+  │
+  ├── Step 2: 查找融合函数
+  │     types = (Conv2d, BatchNorm2d, ReLU)
+  │     在 DEFAULT_OP_LIST_TO_FUSER_METHOD 字典中查找
+  │     → 找到: fuse_conv_bn_relu
+  │
+  ├── Step 3: 执行融合（分两种模式）
+  │     PTQ 模式: fuse_conv_bn_eval(conv, bn) → 数学折叠 BN 到 Conv
+  │       W' = W × γ / √(σ²+ε), b' = (b-μ)×γ/√(σ²+ε)+β → 返回纯 Conv2d
+  │       再包装为 ConvReLU2d
+  │     QAT 模式: 返回 nniqat.ConvBnReLU2d(conv, bn, relu)
+  │       → QAT 融合模块，内部已包含 BN training + FakeQuantize
+  │
+  ├── Step 4: 迁移 hooks
+  │     原 conv1 的 pre_forward_hooks → 融合模块
+  │     原 relu1 的 forward_hooks → 融合模块
+  │     bn1 的 hooks → 丢弃（BN 不再单独执行）
+  │
+  └── Step 5: 替换模块
+        _set_module(model, 'conv1', ConvBnReLU2d)
+        _set_module(model, 'bn1',   Identity())  ← 占位! 不再执行
+        _set_module(model, 'relu1', Identity())  ← 占位! 不再执行
+```
+
+**支持的融合模式**：
+
+```python
+# 位置: torch/ao/quantization/fuser_method_mappings.py
+_DEFAULT_OP_LIST_TO_FUSER_METHOD = {
+    (nn.Conv2d, nn.BatchNorm2d):              fuse_conv_bn,
+    (nn.Conv2d, nn.BatchNorm2d, nn.ReLU):     fuse_conv_bn_relu,
+    (nn.Conv1d, nn.BatchNorm1d):              fuse_conv_bn,
+    (nn.Linear, nn.BatchNorm1d):              fuse_linear_bn,
+    (nn.Conv2d, nn.ReLU):                     fuse_conv_relu,
+    (nn.Linear, nn.ReLU):                     fuse_linear_relu,
+    (nn.BatchNorm2d, nn.ReLU):                fuse_bn_relu,
+}
+```
+
+---
+
+## 5. Eager Mode QAT：最直观的模式
+
+> Eager Mode 在 PyTorch 2.x 中标记 deprecated，但理解它对理解 FX/PT2E 和 AIMET 至关重要。
+
+### 5.1 核心流程
+
+```
+FP32 Model → model.qconfig = ... → fuse_modules(...) → prepare_qat(model)
+  → train → convert → INT8 Model
+```
+
+关键：`prepare_qat(model)` 递归遍历所有子模块，对每个有 `.qconfig` 的模块，修改其 `forward` 方法——在计算前后插入 weight_fake_quant 和 activation_post_process。
+
+### 5.2 完整代码
+
+```python
+import torch, torch.nn as nn, torchvision
+from torch.ao.quantization import (
+    get_default_qat_qconfig, prepare_qat, convert, fuse_modules)
+
+model = torchvision.models.resnet18(weights="DEFAULT").train()
+
+# 1. 融合
+model = fuse_modules(model, [["conv1","bn1","relu"],
+    ["layer1.0.conv1","layer1.0.bn1","layer1.0.relu"],
+    ["layer1.0.conv2","layer1.0.bn2"], ...])
+
+# 2. qconfig
+model.qconfig = get_default_qat_qconfig("fbgemm")
+
+# 3. prepare (插入 FakeQuantize 到各层 forward 内部)
+model_p = prepare_qat(model, inplace=False)
+
+# 4. 训练
+for m in model_p.modules():
+    if isinstance(m, nn.BatchNorm2d): m.eval()  # BN 冻结
+
+opt = torch.optim.SGD(model_p.parameters(), lr=1e-4)
+for ep in range(10):
+    model_p.train()
+    if ep >= 3: model_p.apply(torch.ao.quantization.disable_observer)
+    for img, tgt in loader:
+        loss = criterion(model_p(img), tgt)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+# 5. convert
+model_p.eval().cpu()
+model_int8 = convert(model_p, inplace=False)
+```
+
+### 5.3 Eager Mode 的局限
+
+| 问题 | 原因 |
+|------|------|
+| 手动融合麻烦 | 需要手写所有 Conv+BN+ReLU 路径名 |
+| FakeQuantize 不可见 | 藏在被 wrap 的 forward() 里，不属于计算图节点 |
+| 无法处理动态控制流 | 带 if/while 的模型不确定在哪插 FakeQuantize |
+| 调试困难 | 无法打印图结构定位量化节点 |
+
+---
+
+## 6. FX Graph Mode QAT：图改写的力量
+
+FX 模式把模型转成一张有向无环图 (DAG)，FakeQuantize 作为独立节点插入图中——你可以打印、检查、修改任何节点。
+
+### 6.1 FX 的核心概念
+
+```python
+import torch.fx
+
+class TinyNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 16, 3)
+        self.relu = nn.ReLU()
+    def forward(self, x): return self.relu(self.conv(x))
+
+gm = torch.fx.symbolic_trace(TinyNet())
+print(gm.code)
+# def forward(self, x):
+#     conv = self.conv(x);  relu = self.relu(conv);  return relu
+
+for node in gm.graph.nodes:
+    print(f"{node.name}: op={node.op}, target={node.target}")
+# x: placeholder    conv: call_module(conv)    relu: call_module(relu)    output
+```
+
+### 6.2 FX 量化管线
+
+```
+FP32 Module → symbolic_trace → GraphModule
+  → prepare_qat_fx(gm, qconfig_mapping, example_inputs)
+      ├── 自动识别融合 pattern
+      ├── 交换为 QAT 模块
+      ├── 根据 qconfig_mapping 标注哪些节点需要量化
+      └── 在标注节点前后插入 FakeQuantize 节点
+  → train
+  → convert_fx → INT8 GraphModule
+```
+
+### 6.3 完整代码
+
+```python
+from torch.ao.quantization import (
+    get_default_qat_qconfig_mapping, QConfigMapping, QConfig,
+    HistogramObserver, PerChannelMinMaxObserver)
+from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
+
+model = torchvision.models.mobilenet_v3_small(weights="DEFAULT").train()
+
+qmap = QConfigMapping()
+qmap.set_global(QConfig(
+    activation=HistogramObserver.with_args(dtype=torch.quint8),
+    weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8,
+          qscheme=torch.per_channel_symmetric)))
+qmap.set_module_name("features.0.0", None)  # 第一层不量化
+qmap.set_module_name("classifier", None)    # 最后一层不量化
+
+example = (torch.randn(1,3,224,224),)
+model_p = prepare_qat_fx(model, qmap, example)
+
+# ★ 打印图——FX 最大优势
+model_p.graph.print_tabular()
+# 能看到 activation_post_process_* 节点——这是 FakeQuantize
+
+# 训练...（同 Eager Mode）
+
+model_int8 = convert_fx(model_p.eval().cpu())
+```
+
+---
+
+## 7. PT2E QAT：为 export 而生的新标准
+
+PT2E (PyTorch 2 Export) 用 `torch.export` 替代 `symbolic_trace`——前者是真正的 AST 级别程序分析，能处理动态控制流。
+
+### 7.1 核心区别
+
+| | FX Graph Mode | PT2E |
+|---|--------------|------|
+| 图捕获 | `symbolic_trace`（跑一遍记录路径） | `torch.export`（AST 级别程序分析） |
+| 控制流 | 不支持动态 if/while | 支持 |
+| 后端适配 | 隐藏在 QConfig 的 Observer 选择中 | 显式 `Quantizer` 对象，可插拔 |
+| 成熟度 | 稳定，生产可用 | PyTorch 2.5+ 推荐 |
+
+### 7.2 完整代码
+
+```python
+from torch.ao.quantization.quantize_pt2e import prepare_qat_pt2e, convert_pt2e
+from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+    XNNPACKQuantizer, get_symmetric_quantization_config)
+from torch._export import capture_pre_autograd_graph
+
+model = torchvision.models.resnet18(weights="DEFAULT").train()
+example = (torch.randn(2,3,224,224),)
+
+# Capture
+gm = capture_pre_autograd_graph(model, example)
+
+# Quantizer——换后端 = 换 Quantizer
+q = XNNPACKQuantizer()
+q.set_global(get_symmetric_quantization_config(is_qat=True))
+
+# Prepare + Train + Convert
+prepared = prepare_qat_pt2e(gm, q)
+# ... QAT 训练 ...
+quantized = convert_pt2e(prepared.eval())
+```
+
+---
+
+## 8. QConfigMapping：按层定制量化策略
+
+```python
+qmap = QConfigMapping()
+qmap.set_global(default_qconfig)                          # 兜底
+qmap.set_object_type(nn.Conv2d, conv_qconfig)              # 所有 Conv2d
+qmap.set_module_name_regex("layer3.*conv", layer3_qconfig) # 正则匹配
+qmap.set_module_name("conv1", None)                        # 精确不量化
+# 优先级: 精确名 > 正则 > 类型 > 全局
+```
+
+---
+
+## 9. 源码汇总：prepare_qat_fx 和 convert_fx 全流程
+
+### 9.1 prepare_qat_fx 的六步走
+
+```
+Step 1: symbolic_trace → GraphModule
+Step 2: 自动融合 (Conv+BN+ReLU → nni.ConvBnReLU2d)
+Step 3: QAT 模块 swap (nni.ConvBnReLU2d → nniqat.ConvBnReLU2d)
+Step 4: 量化标注 (根据 qconfig_mapping 给图节点打标签)
+Step 5: 插入 Observer/FakeQuantize 节点 (在图 op 后面创建新节点)
+Step 6: 返回 GraphModule
+```
+
+**Step 5 的核心图变换**（这是整个 FX 量化最精妙的操作）:
+
+```python
+# 对每个需要量化的 node，在它后面插入 observer：
+with model.graph.inserting_after(node):
+    obs_node = model.graph.create_node('call_module', obs_name, args=(node,))
+node.replace_all_uses_with(obs_node)  # 下游消费者改接 observer 输出
+obs_node.args = (node,)               # 恢复 observer 的输入指向
+```
+
+### 9.2 convert_fx 的替换逻辑
+
+```
+对每个 FakeQuantize 节点:
+  1. 读取其 scale / zero_point
+  2. 替换为真正的 Q/DQ 节点
+  3. 如果 backend 支持 INT8 Conv:
+     DQ + Conv + Q → 融合为一个 INT8 Conv（零开销量化推理）
+```
+
+---
+
+## 10. QAT 训练实战技巧
+
+**BN 冻结**：FakeQuantize 改变激活分布 → BN running stats 被污染 → 必须冻结。
+
+```python
+for m in model.modules():
+    if isinstance(m, nn.BatchNorm2d):
+        m.eval()
+        m.weight.requires_grad_(False)
+        m.bias.requires_grad_(False)
+```
+
+**Observer 调度**：前 2-3 epoch 开 observer（收集 scale），之后关掉（固定 scale 训练）。
+
+**学习率**：1e-4 ~ 5e-5，cosine annealing。QAT 是微调不是从头训练——LR 太大会"忘记"预训练权重。
+
+---
+
+## 11. 动手实验
+
+| # | 实验 | 时间 |
+|---|------|:--:|
+| 1 | MobileNetV3 用 Eager/FX/PT2E 三种模式各跑一次 QAT | 1h |
+| 2 | `print_tabular()` 打印 FX 图，标注每个 FakeQuantize 节点的位置 | 20min |
+| 3 | 对比三种模式在同一模型上的代码量、可 debug 性、最终精度 | 30min |
+
+---
+
+## 检验标准
+
+- [ ] 能画出 Observer 的完整继承树（6 个类）
+- [ ] 能解释 FakeQuantize 双开关状态机的三阶段切换
+- [ ] 能说出 QuantStub/DeQuantStub 在 prepare_qat 和 convert 中分别变成什么
+- [ ] 能画出 fuse_modules 的完整六步流程
+- [ ] 能在 MobileNetV3 上跑通 Eager / FX / PT2E 三种模式
+- [ ] 能解释 `prepare_qat_fx` 如何用 `inserting_after` + `replace_all_uses_with` 修改图
+- [ ] 能配置 QConfigMapping 实现"第一层和最后一层不量化，其余 8-bit"
+
+---
+
+> 💡 **学习建议**：本章从底层 Observer 讲到顶层 convert_fx——每一层都配有简化源码。学习路径建议：先读 §1-4（独立模块）→ 再读 §5-7（三种 API 模式）→ 最后 §9（看 prepare_qat_fx 如何把前面所有模块串起来）。
+>
+> Next: [Stage 1.5: QAT 训练深度剖析 — 从"能跑"到"理解为什么"](./Stage1.5_QAT训练深度剖析.md)
