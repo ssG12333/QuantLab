@@ -6,7 +6,7 @@
 > *From IEEE 754 floating-point bit layout to LLaMA 4-bit QLoRA fine-tuning — turning model quantization from "parameter tuning" into systematic engineering.*
 > ***🔥 Ongoing: from low-level math to production deployment, one bit at a time.***
 
-[![Stages](https://img.shields.io/badge/stages-9-blue)](QAT_LEARNING_ROADMAP.md)
+[![Stages](https://img.shields.io/badge/stages-10-blue)](QAT_LEARNING_ROADMAP.md)
 [![Notebooks](https://img.shields.io/badge/notebooks-4篇-green)](notebooks/)
 [![Status](https://img.shields.io/badge/status-持续更新_ongoing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
@@ -50,9 +50,10 @@
 
 | # | 阶段 / Stage | 核心内容 | 难度 |
 |---|------|---------|:--:|
-| 0 | **量化基础 + 硬件基石**<br>*Quantization Basics & Hardware* | 浮点位布局 · 量化公式推导 · 四种校准器 · VNNI/DP4A/TensorCore · PyTorch Observer/FakeQuantize/Stubs/fuse_modules 源码深潜 | ⭐ |
-| 1 | **PyTorch QAT 三种模式**<br>*PyTorch QAT APIs* | Eager → FX → PT2E · prepare_qat_fx/convert_fx 图改写源码 · Conv+BN 融合推导 | ⭐⭐ |
-| 2 | **LSQ 核心算法**<br>*Learned Step Size* | 可学习 scale · 手推梯度公式 · 从零实现 · LSQ+/PACT/DoReFa-Net | ⭐⭐⭐ |
+| 0 | **量化基础 + 硬件基石**<br>*Quantization Basics* | 纯理论地基：浮点位布局 · 量化公式推导 · 四种校准器 · VNNI/DP4A/TensorCore · 手写推理引擎 | ⭐ |
+| 1 | **PyTorch 量化全景**<br>*PyTorch Quant Stack* | Observer继承树 · FakeQuantize状态机 · Stubs生命周期 · fuse_modules流程 · Eager/FX/PT2E · 图改写源码 | ⭐⭐ |
+| 1.5 | **QAT 训练深度剖析** 🆕<br>*QAT Deep Dive* | 手写FakeQuantize · Observer消融 · 比特崩溃点 · BN冻结原理 · 失败案例诊断 · 引出LSQ | ⭐⭐⭐ |
+| 2 | **LSQ — 让 scale 活起来**<br>*Learned Step Size* | 从崩溃点自然引出 · STE深潜 · 公式(6)推导 · Gradient Scaling · 从零实现 · PyTorch对比 | ⭐⭐⭐ |
 | 3 | **PTQ 进阶算法**<br>*Advanced PTQ* | AdaRound (Taylor→QUBO) · FlexRound · GPTQ (Hessian→Cholesky) | ⭐⭐⭐⭐ |
 | 4 | **YOLO 量化实战**<br>*YOLO Quantization* | YOLOv8 PTQ vs QAT vs LSQ 消融实验 · ONNX QDQ · TensorRT INT8 | ⭐⭐⭐ |
 | 5 | **工业框架**<br>*Industrial Frameworks* | PPQ (IR→Pass→Backend) · AIMET (QuantSim + Range Learning QAT → DLC) | ⭐⭐⭐⭐ |
