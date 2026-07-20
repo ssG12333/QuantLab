@@ -452,6 +452,90 @@ for name, cal in [("MinMax",MinMaxCalibrator()),("Percentile",PercentileCalibrat
 
 **一个常见的坑**：对 LLM 的激活值不要用 Percentile——LLM 的 outlier channel 不是噪声，是模型"精心"学到的注意力信号。删掉它们 = 删掉核心能力。这就是 Stage 6 的 SmoothQuant 和 AWQ 试图解决的问题。
 
+### 5.4 串联：scale 的前世今生 —— 从公式到 LSQ
+
+上面四种校准器都在做同一件事：**找到一对 (S, Z)，让量化后的数据尽可能接近原始数据**。但你在后面每个 Stage 里看到的 "scale" 是同一个概念的不同演化形态。这里画一条完整的演化线——读完这节，后面学到任何阶段你都知道 "scale 从哪来、怎么被用、最后怎么被取代"。
+
+```
+[1] 纯数学阶段 — 一个公式
+─────────────────────────
+  Stage 0 §2: S = (r_max - r_min) / (q_max - q_min)
+               Z = q_min - round(r_min / S)
+
+  这是 scale 的"定义"。你知道 S 和 Z 怎么从数据范围算出来。
+  但你只有数据，没有框架——S 和 Z 只是你手写在纸上的两个数。
+
+
+[2] 校准阶段 — 数据驱动的 S 确定
+───────────────────────────────
+  Stage 0 §5: 四种校准器 (MinMax / Percentile / MSE / KL)
+
+  现在你有校准数据了。你从训练集中抽几百张图（不需要标签），
+  跑一遍模型，记录每层激活值的分布。
+  四种校准器提供四种"怎么从数据分布中选 r_max / r_min"的策略。
+
+  核心权衡: 覆盖范围 vs 分辨率
+    范围太大 → 每个量化等级间距大 → 精度粗 → Round Error 大
+    范围太小 → 太多数据被 clip → Clip Error 大
+
+  ★ 校准器做的事 = 找到 r_max 和 r_min 的最优值，
+    然后代入 [1] 的公式算出 S 和 Z。
+
+
+[3] 框架阶段 — Observer 自动化
+──────────────────────────────
+  Stage 1 §9: PyTorch 的 Observer 类体系
+
+  不能每一层手动校准——Observer 把 [2] 的校准过程自动化了。
+  Observer 的 forward() 在每个 batch 中收集 min/max，
+  calculate_qparams() 用 [1] 的公式算出 scale 和 zero_point。
+
+  MovingAverageMinMaxObserver:
+    self.min_val += α × (observed_min - self.min_val)      ← EMA 平滑
+    self.max_val += α × (observed_max - self.max_val)
+    scale = max(|min_val|, |max_val|) / 127                 ← ❄ [1] 的公式!
+    zero_point = 0
+
+  ★ Observer 做的事 = 把 [2] 的校准算法嵌入到 PyTorch Module 中，
+    让 scale 在每个 forward 时自动更新。
+
+
+[4] QAT 阶段 — scale 固定
+─────────────────────────
+  Stage 1.5: 固定 scale QAT
+
+  Observer 在校准阶段收集了 min/max，算出了 scale。
+  然后 observer_enabled 被设为 0 —— scale 冻结。
+  后续 7-8 个 epoch QAT 训练中，这个被冻结的 scale 全程不变。
+  weight 在变，但 scale 不跟着变。
+
+  8-bit (256 个等级): 没事——grid 够密，scale 差一点也能凑合
+  4-bit (16 个等级): 开始出问题——scale 微小的偏差被放大
+  2-bit (4 个等级):  崩溃——scale 几乎不可能"正好"对
+
+  ★ 固定 scale 的上限在 4-bit —— Stage 1.5 的实验数据证明了这一点。
+
+
+[5] LSQ 阶段 — scale 可学习
+───────────────────────────
+  Stage 2: LSQ (Learned Step Size Quantization)
+
+  [4] 的固定 scale 在低比特下不够。LSQ 的解决方案：
+  把 register_buffer("scale") 改成 nn.Parameter(scale_init)。
+
+  scale 不再是 Observer 一次性算出来然后冻住的——它和 weight
+  一起被梯度下降优化。weight 分布变了 → scale 自动跟着调。
+
+  LSQ 的 backward:
+    ∂v̂/∂s = -v/s + round(v̄)                    ← scale 的梯度, ❄ 公式 (6)
+    grad_scale = grad_scale / √(N × Q_P)        ← Gradient Scaling, ❄ 公式 (13)
+
+  ★ LSQ 做的事 = 把 scale 从 "Observer 的一次性输出" 升级为
+    "和 weight 平级的可学习参数"——量化网格永远对齐当前 weight 分布。
+```
+
+**这条线的核心信息**：scale 从一个数学公式 (`S = range / 255`) 开始，经过校准器确定最优范围、Observer 自动化收集统计、QAT 中冻结使用、最终在 LSQ 中变成可学习参数。**后面所有 Stage 里提到的 "scale"，都是这同一个概念——只是它在不同阶段的"状态"不同。** 当你看到 Stage 3 的 GPTQ 在 "逐列优化 weight 的量化 scale"、Stage 7 的 QLoRA 在 "对 scale 做 Double Quantization" 时——你已经在 Stage 0 见过它的原点了。
+
 ---
 
 ## 6. 舍入策略：四舍五入就够了吗
