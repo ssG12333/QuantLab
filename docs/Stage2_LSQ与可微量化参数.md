@@ -957,7 +957,7 @@ prepared = prepare_qat_pt2e(gm, quantizer)
 # ↑ LSQFakeQuantize.scale 是 nn.Parameter — optimizer 能看到
 
 # Step 4: QAT Training
-opt = torch.optim.SGD(prepared.parameters(), lr=1e-4)
+opt = torch.optim.SGD(prepared.parameters(), lr=0.0001)
 # ↑ ★ LSQ 的 scale (nn.Parameter) 和 weight
 #   一起在 prepared.parameters() 里!
 #   optimizer 自动更新两者

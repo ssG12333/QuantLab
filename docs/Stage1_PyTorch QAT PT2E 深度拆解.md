@@ -135,7 +135,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, x):
     #           ↑ ATen 函数调用, 不是 nn.Module!
 
     _bn = torch.ops.aten._native_batch_norm_legit_functional.default(
-        _conv2d, arg4_1, arg5_1, arg2_1, arg3_1, True, 0.1, 1e-5
+        _conv2d, arg4_1, arg5_1, arg2_1, arg3_1, True, 0.1, 0.00001
     )
     # ↑ BN 也被展开为 ATen 函数，weight/bias/running_mean/running_var 都是输入
 
@@ -2035,7 +2035,7 @@ for epoch in range(num_epochs):
 
 ### 13.3 学习率
 
-QAT 是微调不是从头训练。`lr = 1e-4 ~ 5e-5`（比原始训练的 lr 低 10-100 倍）。使用 cosine annealing。太大会 "忘记" 预训练权重。
+QAT 是微调不是从头训练。`lr = 0.0001 ~ 0.00005`（比原始训练的 lr 低 10-100 倍）。使用 cosine annealing。太大会 "忘记" 预训练权重。
 
 ### 13.4 第一层和最后一层不量化
 

@@ -284,7 +284,7 @@ class AdaRoundQuantizer(nn.Module):
         return w_clamped * self.scale
 
 
-def adaround_optimize(weight, scale, input_data, n_iter=10000, lr=1e-3):
+def adaround_optimize(weight, scale, input_data, n_iter=10000, lr=0.001):
     """
     优化 AdaRound 的 v 参数。
 
@@ -425,7 +425,7 @@ def flexround_optimize(weight, scale, input_data, n_iter=10000):
     quant = FlexRoundQuantizer(weight.shape, scale)
 
     fisher = compute_fisher_diag(weight, input_data)
-    opt = torch.optim.Adam([quant.log_t], lr=1e-3)
+    opt = torch.optim.Adam([quant.log_t], lr=0.001)
     taus = torch.logspace(1, -1, n_iter)
 
     for i in range(n_iter):
@@ -527,7 +527,7 @@ def cross_layer_equalization(conv1_weight, conv2_weight):
         r2 = r2.abs().amax(dim=2)  # [C_out2, C_in2(=C_out1)]
 
         # S_i 使得均衡后两层的范围相近
-        S = torch.sqrt(r1 / (r2.amax(dim=0) + 1e-8))
+        S = torch.sqrt(r1 / (r2.amax(dim=0) + 0.00000001))
 
         # 应用均衡
         c1_new = conv1_weight.clone()
@@ -801,7 +801,7 @@ def gptq_quantize_layer(W, X, n_bits=4, group_size=128, block_size=128):
     # Step 1: 计算 Hessian H = X^T X
     H = X.T @ X         # [d_in, d_in]
     # 加正则化防止奇异性
-    H.diagonal().add_(1e-5 * torch.mean(torch.diag(H)))
+    H.diagonal().add_(0.00001 * torch.mean(torch.diag(H)))
 
     # Step 2: Cholesky 分解
     L = torch.linalg.cholesky(H)  # [d_in, d_in], 下三角

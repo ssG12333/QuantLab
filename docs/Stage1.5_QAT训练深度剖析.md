@@ -106,11 +106,11 @@ class MyFakeQuantize(nn.Module):
 
         if self.symmetric:
             abs_max = torch.max(self.min_val.abs(), self.max_val.abs())
-            self.scale = abs_max / (self.qmax / 2) + 1e-8
+            self.scale = abs_max / (self.qmax / 2) + 0.00000001
         else:
             self.scale = (self.max_val - self.min_val) / (
                 self.qmax - self.qmin
-            ) + 1e-8
+            ) + 0.00000001
 
     def forward(self, x):
         if self.observer_enabled:
@@ -604,7 +604,7 @@ def track_bn_running_mean(model_fn, train_loader, freeze=True, n_epochs=10):
 |------|------|
 | 通用 QAT | **全程冻结 BN**。safe and simple |
 | 校准数据很少 (<100 张) | **全程冻结 BN**。此时 BN 没足够数据收敛 |
-| QAT 训练较长 (≥20 epoch) | 可以最后 2-3 epoch 解冻 BN，但需极小 lr (1e-6) |
+| QAT 训练较长 (≥20 epoch) | 可以最后 2-3 epoch 解冻 BN，但需极小 lr (0.000001) |
 | 检测模型 (YOLO/FCOS) | **全程冻结 BN**。检测头的 reg 分支对 BN 漂移极度敏感 |
 | Transformer / LLM | 没有 BN（用 LayerNorm），此条不适用 |
 
@@ -622,7 +622,7 @@ def track_bn_running_mean(model_fn, train_loader, freeze=True, n_epochs=10):
 |---|------|----------|---------|------|
 | 1 | **QAT 精度比 PTQ 还差** | Observer 开启时间太短, scale 没收敛 | 打印每个 epoch 后的 scale 值——如果还在大幅变化，说明没收敛 | 延长 observer 开启到 5 epoch；或增加校准数据量 |
 | 2 | **Loss 剧烈震荡 (std > 0.5× mean)** | BN 未冻结，running stats 在漂移 | 检查 `bn.training` 是否为 True；打印 running_mean 看是否有明显漂移 | `model.eval()` for BN + `requires_grad_(False)` |
-| 3 | **训练中某 epoch 后 loss 突升** | LR 过大，"忘记"了预训练权重 | 在 QAT 模式下做 1 个 epoch 的不更新训练（纯前向），观察 loss — 如果已经比 FP32 的 loss 高很多，说明初始偏移太大 | 降 LR 到 1e-5；或用 warmup: 前 100 step LR 从 1e-6 升到目标值 |
+| 3 | **训练中某 epoch 后 loss 突升** | LR 过大，"忘记"了预训练权重 | 在 QAT 模式下做 1 个 epoch 的不更新训练（纯前向），观察 loss — 如果已经比 FP32 的 loss 高很多，说明初始偏移太大 | 降 LR 到 0.00001；或用 warmup: 前 100 step LR 从 0.000001 升到目标值 |
 | 4 | **某些通道输出全部相同** | `reduce_range=True` 误用 | 检查 qconfig 中的 `reduce_range` 参数 | `reduce_range=False` |
 | 5 | **导出模型大小没变** | 忘记 `convert()` — FakeQuantize 还在模型里 | 检查模型中的 op 类型: `print(model)` 看有没有 `FakeQuantize` | `model_int8 = convert(model_prepared.eval())` |
 | 6 | **ONNX 没有 QDQ 节点** | opset 过低 (<13) | 检查导出时的 opset 版本 | `opset_version=17` |
