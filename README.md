@@ -126,6 +126,7 @@ QuantLab/
 
 ## 学习原则 / Principles
 
+- **FP32 → INT8 是心智锚点** *FP32→INT8 is your mental anchor* —— 全文所有例子、公式、代码默认都是 FP32→INT8。其他比特宽度（4-bit、2-bit、FP8）统一从这个基线往下推，而不是当作独立概念。先把"32 位浮点压缩到 8 位整数"刻进脑子，再学其他格式。
 - **先问"为什么"，再问"怎么做"** *Ask "why" before "how"* —— 不理解 FakeQuantize 为什么用两个独立 flag，换个场景就懵了。
 - **从 YOLO 到 LLaMA，由简到难** *From simple to complex* —— 用小模型把基本功练到手熟，再上大模型。
 - **源码不是"选读"，是"必修"** *Source code is mandatory* —— observer.py、fake_quantize.py、stubs.py、fuse_modules.py 逐文件拆解。

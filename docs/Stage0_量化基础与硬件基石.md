@@ -186,6 +186,12 @@ print(f"\nINT8 只有 FP32 的 {256/2**32*100:.8f}% 表示能力——但配合 
 
 ## 2. 量化公式：一步一步推导
 
+> **📌 心智锚点：本教程所有例子以 FP32 → INT8 为基准。**
+> INT8 是工业界的默认起点——256 个等级、对称范围 [-128, 127]、非对称范围 [0, 255]。
+> 看到 `q_min = -128`、`q_max = 127`、除以 `255` 或 `127` 时，脑子里自动浮现"这是 INT8"。
+> 其他比特宽度（4-bit、2-bit）只是把这个基准里的 256 换成 16 或 4——公式不变，锚点不变。
+> 先把 FP32→INT8 练成肌肉记忆，再往下推到 sub-byte。
+
 ### 2.1 从实数到整数的映射
 
 量化的本质是找一个**线性映射**，把连续实数域映射到有限整数域：
@@ -462,11 +468,13 @@ acts = torch.relu(torch.randn(10000) * 2.0 + 0.5)
 wts  = torch.randn(10000) * 0.3
 
 def quant_sym(x, n=8):
+    """FP32→INTn 对称量化 (默认 INT8: n=8, q_max=127) ← 这是基线"""
     S = x.abs().max() / (2**(n-1)-1)
     q = torch.round(x / S).clamp(-2**(n-1)+1, 2**(n-1)-1)
     return S*q, S
 
 def quant_asym(x, n=8):
+    """FP32→INTn 非对称量化 (默认 INT8: n=8, q_max=255) ← 这是基线"""
     S = (x.max() - x.min()) / (2**n - 1)
     Z = torch.round(-x.min() / S).clamp(0, 2**n - 1)
     q = torch.round(x / S + Z).clamp(0, 2**n - 1)
@@ -906,6 +914,7 @@ X_q = q * S_token.unsqueeze(2)
 import torch
 
 class MinMaxCalibrator:
+    """FP32→INT8 MinMax 校准器 ← INT8 基线 (n_bits=8)"""
     def calibrate(self, x, symmetric=False, n_bits=8):
         q_max = 2**(n_bits-1)-1 if symmetric else 2**n_bits-1
         if symmetric:
@@ -916,6 +925,7 @@ class MinMaxCalibrator:
             self.zero_point = torch.round(-x.min()/self.scale).clamp(0, q_max)
 
 class PercentileCalibrator:
+    """FP32→INT8 Percentile 校准器 — 抗 outlier"""
     def calibrate(self, x, pct=0.999, n_bits=8):
         s = x.flatten().sort().values; n = len(s)
         lo, hi = s[int(n*(1-pct))], s[int(n*pct)]
@@ -1232,7 +1242,11 @@ SNR(dB) ≈ 6.02 × n + 1.76    (均匀量化, 全范围信号)
 
 ---
 
-## 9. Sub-byte 量化：当 8 个值都不够用
+## 9. Sub-byte 量化：从 INT8 基线往下推
+
+> **本节的前提是：你已经熟悉 FP32→INT8 的完整映射。** 这里做的就是把 256 个等级（8-bit）逐步减少：128→64→16→8→4 个等级。
+> 公式一模一样——`S = range / (2^n - 1)`，`q = round(r / S + Z)`，只是 `n` 变小了。
+> 锚点还是 INT8，只是在往下探"极限在哪"。
 
 ### 9.1 低比特的量化网格
 
