@@ -371,7 +371,7 @@ if __name__ == '__main__':
     base = Path(r'c:\Users\weijiashengs\Desktop\量化学习o\notebooks')
 
     enhance_stage0(str(base / 'Stage0_量化基础与硬件基石.ipynb'))
-    enhance_stage1(str(base / 'Stage1_PyTorch原生QAT三种模式.ipynb'))
+    enhance_stage1(str(base / 'Stage1_PyTorch QAT PT2E 深度拆解.ipynb'))
     enhance_stage15(str(base / 'Stage1.5_QAT训练深度剖析.ipynb'))
     enhance_stage2(str(base / 'Stage2_LSQ与可微量化参数.ipynb'))
 

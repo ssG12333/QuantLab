@@ -7,12 +7,12 @@
 | 模块 | PyTorch 源文件 | 笔记位置 |
 |------|---------------|----------|
 | Observer 家族 | `torch/ao/quantization/observer.py` | 已整合在 [Stage0](../docs/Stage0_量化基础与硬件基石.md) §8 |
-| FakeQuantize 内核 | `torch/ao/quantization/fake_quantize.py` | 已整合在 [Stage0](../docs/Stage0_量化基础与硬件基石.md) §9 和 [Stage1](../docs/Stage1_PyTorch原生QAT三种模式.md) §1 |
+| FakeQuantize 内核 | `torch/ao/quantization/fake_quantize.py` | 已整合在 [Stage0](../docs/Stage0_量化基础与硬件基石.md) §9 和 [Stage1](../docs/Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) §1 |
 | QuantStub / DeQuantStub | `torch/ao/quantization/stubs.py` | 已整合在 [Stage0](../docs/Stage0_量化基础与硬件基石.md) §10 |
 | fuse_modules 内部流程 | `torch/ao/quantization/fuse_modules.py` | 已整合在 [Stage0](../docs/Stage0_量化基础与硬件基石.md) §11 |
-| prepare_qat_fx 图改写 | `torch/ao/quantization/quantize_fx.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch原生QAT三种模式.md) §5 |
-| convert_fx 转换管线 | `torch/ao/quantization/fx/convert.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch原生QAT三种模式.md) §6 |
-| QConfigMapping 匹配系统 | `torch/ao/quantization/qconfig.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch原生QAT三种模式.md) §8 |
+| prepare_qat_fx 图改写 | `torch/ao/quantization/quantize_fx.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) §5 |
+| convert_fx 转换管线 | `torch/ao/quantization/fx/convert.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) §6 |
+| QConfigMapping 匹配系统 | `torch/ao/quantization/qconfig.py` | 已整合在 [Stage1](../docs/Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) §8 |
 
 ## 待拆解的模块
 

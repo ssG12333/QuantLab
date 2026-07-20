@@ -160,9 +160,10 @@ if __name__ == '__main__':
 
     stages = [
         'Stage0_量化基础与硬件基石',
-        'Stage1_PyTorch原生QAT三种模式',
+        'Stage1_PyTorch QAT PT2E 深度拆解',
         'Stage1.5_QAT训练深度剖析',
         'Stage2_LSQ与可微量化参数',
+        'Stage3_PTQ进阶算法',
     ]
 
     print("Converting markdown to Jupyter notebooks:\n")

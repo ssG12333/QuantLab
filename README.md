@@ -7,7 +7,7 @@
 > ***🔥 Ongoing: from low-level math to production deployment, one bit at a time.***
 
 [![Stages](https://img.shields.io/badge/stages-10-blue)](QAT_LEARNING_ROADMAP.md)
-[![Notebooks](https://img.shields.io/badge/notebooks-4篇-green)](notebooks/)
+[![Notebooks](https://img.shields.io/badge/notebooks-5篇-green)](notebooks/)
 [![Status](https://img.shields.io/badge/status-持续更新_ongoing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
@@ -35,9 +35,10 @@
 |---|---|
 | 了解全局路线 | [9 阶段路线图](QAT_LEARNING_ROADMAP.md) |
 | 建立量化直觉 + 啃 PyTorch 源码 | [📓 Stage 0：量化基础](notebooks/Stage0_量化基础与硬件基石.ipynb) |
-| 搞懂 PyTorch QAT 三种模式 | [📓 Stage 1：PyTorch QAT 全景](notebooks/Stage1_PyTorch原生QAT三种模式.ipynb) |
-| QAT 训练深度剖析 | [📓 Stage 1.5：QAT 训练深剖](notebooks/Stage1.5_QAT训练深度剖析.ipynb) |
-| 学 LSQ 核心算法 | [📓 Stage 2：LSQ](notebooks/Stage2_LSQ与可微量化参数.ipynb) |
+| 搞懂 PyTorch QAT 全流程（PT2E 源码级） | [📓 Stage 1：PyTorch QAT 全景](notebooks/Stage1_PyTorch%20QAT%20PT2E%20深度拆解.ipynb) |
+| QAT 训练深度剖析（手写+消融+诊断） | [📓 Stage 1.5：QAT 训练深剖](notebooks/Stage1.5_QAT训练深度剖析.ipynb) |
+| 学 LSQ 核心算法（autograd 源码级） | [📓 Stage 2：LSQ](notebooks/Stage2_LSQ与可微量化参数.ipynb) |
+| 学 PTQ 进阶算法 | [📓 Stage 3：PTQ 进阶](notebooks/Stage3_PTQ进阶算法.ipynb) |
 | 查 PyTorch 源码拆解笔记 | [🔍 源码分析](source-notes/README.md) |
 | 跑独立可运行代码 | [💻 代码实现](code/README.md) |
 | 读论文笔记 | [📝 论文笔记](paper-notes/README.md) |
@@ -50,11 +51,11 @@
 
 | # | 阶段 / Stage | 核心内容 | 难度 |
 |---|------|---------|:--:|
-| 0 | **量化基础 + 硬件基石**<br>*Quantization Basics* | 纯理论地基：浮点位布局 · 量化公式推导 · 四种校准器 · VNNI/DP4A/TensorCore · 手写推理引擎 | ⭐ |
-| 1 | **PyTorch 量化全景**<br>*PyTorch Quant Stack* | Observer继承树 · FakeQuantize状态机 · Stubs生命周期 · fuse_modules流程 · Eager/FX/PT2E · 图改写源码 | ⭐⭐ |
-| 1.5 | **QAT 训练深度剖析** 🆕<br>*QAT Deep Dive* | 手写FakeQuantize · Observer消融 · 比特崩溃点 · BN冻结原理 · 失败案例诊断 · 引出LSQ | ⭐⭐⭐ |
-| 2 | **LSQ — 让 scale 活起来**<br>*Learned Step Size* | 从崩溃点自然引出 · STE深潜 · 公式(6)推导 · Gradient Scaling · 从零实现 · PyTorch对比 | ⭐⭐⭐ |
-| 3 | **PTQ 进阶算法**<br>*Advanced PTQ* | AdaRound (Taylor→QUBO) · FlexRound · GPTQ (Hessian→Cholesky) | ⭐⭐⭐⭐ |
+| 0 | **量化基础 + 硬件基石**<br>*Quantization Basics* | 浮点位布局(FP32/16/BF16/INT8/FP8) · 量化公式推导 · 四种校准器 · VNNI/DP4A/TensorCore指令级 · Sub-byte量化 · NF4+DoubleQuant · 误差分析 · 手写推理引擎 | ⭐ |
+| 1 | **PyTorch 量化全景（PT2E 深度拆解）**<br>*PyTorch Quant Stack* | 五步管线 · ATen 图捕获 · Quantizer 标注 · FQ 插入四种情形 · 算子级分派表 · tensor 数据流追踪 · Observer/FakeQuantize 状态机 · fuse_modules · Eager/FX/PT2E 对比 | ⭐⭐ |
+| 1.5 | **QAT 训练深度剖析** 🆕<br>*QAT Deep Dive* | 手写FakeQuantize · Observer消融(4种×多比特) · 比特崩溃点(SNR分析) · BN冻结原理(running_mean漂移) · 失败案例诊断手册 · 引出LSQ | ⭐⭐⭐ |
+| 2 | **LSQ — 让 scale 活起来**<br>*Learned Step Size* | autograd.Function生命周期 · STE C++内核 · 公式(6)手推 · Gradient Scaling完整推导 · LSQ+完整实现 · PT2E集成 · PACT→LSQ演进 | ⭐⭐⭐ |
+| 3 | **PTQ 进阶算法**<br>*Advanced PTQ* | AdaRound(Taylor→QUBO→Soft Relax) · FlexRound · CLE · Bias Correction · GPTQ(Hessian→Cholesky加速) | ⭐⭐⭐⭐ |
 | 4 | **YOLO 量化实战**<br>*YOLO Quantization* | YOLOv8 PTQ vs QAT vs LSQ 消融实验 · ONNX QDQ · TensorRT INT8 | ⭐⭐⭐ |
 | 5 | **工业框架**<br>*Industrial Frameworks* | PPQ (IR→Pass→Backend) · AIMET (QuantSim + Range Learning QAT → DLC) | ⭐⭐⭐⭐ |
 | 6 | **LLM PTQ 全家桶**<br>*LLM PTQ Stack* | GPTQ/AWQ/SmoothQuant/SpinQuant · Outlier 问题 + 旋转消除 | ⭐⭐⭐⭐ |
@@ -87,11 +88,11 @@ QuantLab/
 ├── QAT_LEARNING_ROADMAP.md                ← 9 阶段完整路线图
 │
 ├── 📓 notebooks/                           ← Jupyter Notebook 学习文档
-│   ├── Stage0_量化基础与硬件基石.ipynb        ✅ 纯理论地基
-│   ├── Stage1_PyTorch原生QAT三种模式.ipynb    ✅ PyTorch 量化全景
+│   ├── Stage0_量化基础与硬件基石.ipynb        ✅ 量化基础 + 硬件 + NF4
+│   ├── Stage1_PyTorch QAT PT2E 深度拆解.ipynb    ✅ PyTorch 量化全景（PT2E 源码级）
 │   ├── Stage1.5_QAT训练深度剖析.ipynb        ✅ 手写→消融→崩溃→引出LSQ
-│   ├── Stage2_LSQ与可微量化参数.ipynb        ✅ LSQ 自然延伸
-│   ├── Stage3_PTQ进阶算法.ipynb              📋 AdaRound → FlexRound → GPTQ
+│   ├── Stage2_LSQ与可微量化参数.ipynb        ✅ LSQ + LSQ+ + PT2E 集成
+│   ├── Stage3_PTQ进阶算法.ipynb              ✅ AdaRound/FlexRound/CLE/GPTQ
 │   ├── Stage4_YOLO量化实战.ipynb             📋 PTQ vs QAT vs LSQ 消融实验
 │   ├── Stage5_工业级框架.ipynb               📋 PPQ + AIMET
 │   ├── Stage6_大模型PTQ.ipynb                📋 GPTQ/AWQ/SmoothQuant/SpinQuant
@@ -143,7 +144,7 @@ QuantLab/
 | Stage 1 · PyTorch 量化全景 | ✅ | 2026-07-13 |
 | Stage 1.5 · QAT 训练深度剖析 | ✅ | 2026-07-13 |
 | Stage 2 · LSQ 核心算法 | ✅ | 2026-07-13 |
-| Stage 3 · PTQ 进阶算法 | 📋 | — |
+| Stage 3 · PTQ 进阶算法 | ✅ | 2026-07-20 |
 | Stage 4 · YOLO 量化实战 | 📋 | — |
 | Stage 5 · PPQ + AIMET | 📋 | — |
 | Stage 6 · 大模型 PTQ | 📋 | — |
