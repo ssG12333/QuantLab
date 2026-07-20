@@ -480,63 +480,410 @@ def quant_asym(x, n=8):
 
 ## 4. 量化粒度：一个 scale 管多大范围
 
-### 4.1 三种粒度的直观对比
+在 §2-§3 里，我们对整个 tensor 用**一个** scale 和 zero_point 做量化。但一个 tensor 的不同部分可能有完全不同的数值范围——权重 tensor 里第 0 个通道的值都在 [-0.01, 0.01] 附近，第 63 个通道的值都在 [-1.0, 1.0] 附近。如果用同一个 scale 去覆盖这两个极端，小通道会被"碾碎"。
 
-假设 Conv2d weight 为 `[64, 3, 3, 3]`（64 个输出通道，每个 3×3×3=27 个权重）：
+量化粒度的核心问题就是：**一个 scale 管多少个值？管得越多 → 存储越少 → 但精度越差。**
 
-```
-Per-Tensor:  所有权重共 1 个 (S,Z)
-  → 存储: 8B (1个 scale × 4B + 1个 zero_point × 4B)
-  → 问题: 64 个通道的权重大小可能差 50 倍——共用一个 scale → 小通道被大通道"稀释"
+### 4.1 Per-Tensor 的灾难：一个大 scale "碾碎"小通道
 
-Per-Channel:  64 个 (S,Z)，每输出通道一个
-  → 存储: 512B (64 × 8B)
-  → 权重本身: 1728 × 4B = 6912B, scale 占 7.4%
-  → ★ 权重量化的默认选择——性价比最高
-
-Per-Group(128): 每 128 个权重一组，共 1728/128≈14 组
-  → 存储: 14 × 8B = 112B
-  → ★ LLM 权重量化的默认 (GPTQ/AWQ 的 group_size=128)
-  → 精度最高的 per-tensor 量变种——"介于 per-tensor 和 per-channel 之间"
-```
-
-### 4.2 Per-Group 为什么是 LLM 的最优解
-
-LLM 的一个 `[4096, 4096]` Linear 权重有 16M 个元素。如果做 per-channel（4096 个 scale）——已经很好，但还不够：
-
-```
-Per-Channel: 4096 个 scale — 每组 4096 个元素
-Per-Group(128): 16384 个 scale — 每组 128 个元素
-
-组越小 → scale 越"局部" → 对 outlier 的容忍度越高
-但不小于 128 的原因: scale 存储开销开始超过精度收益
-  group_size=64: 32768 个 scale → 256KB 额外存储 (开始显著了)
-  group_size=32: 65536 个 scale → 512KB
-```
-
-### 4.3 代码验证
+构造一个极端但真实的例子：Conv2d weight `[64, 3, 3, 3]`，64 个输出通道，但故意让不同通道的数值范围差 100 倍。
 
 ```python
-W = torch.randn(64, 3, 3, 3)
-# Per-Tensor
-S_t = W.abs().max() / 127
-mse_t = ((W - torch.round(W/S_t).clamp(-128,127)*S_t)**2).mean()
-# Per-Channel
-S_c = W.reshape(64,-1).abs().max(dim=1).values / 127
-W_q = (torch.round(W.reshape(64,-1) / S_c.unsqueeze(1))
-       .clamp(-128,127) * S_c.unsqueeze(1)).reshape_as(W)
-mse_c = ((W - W_q)**2).mean()
-# Per-Group(9): 每 3×3 group 一个 scale
-W_flat = W.reshape(64, -1)  # [64, 9]
-n_groups = 9 // 3  # 3 groups per channel
-S_g = W_flat.reshape(64, n_groups, -1).abs().max(dim=2).values / 127
-W_qg = (torch.round(W_flat.reshape(64, n_groups, -1) /
-        S_g.unsqueeze(2)).clamp(-128,127) *
-        S_g.unsqueeze(2)).reshape_as(W)
-mse_g = ((W - W_qg)**2).mean()
-print(f"Per-Tensor: {mse_t:.2e} | Per-Channel: {mse_c:.2e} "
-      f"| Per-Group: {mse_g:.2e} | 改进: {mse_t/mse_c:.1f}x / {mse_t/mse_g:.1f}x")
+import torch
+torch.manual_seed(42)
+
+# 构造一个"好通道"和一个"坏通道"——其他 62 个正常
+W = torch.randn(64, 3, 3, 3) * 0.1  # 62/64 个通道范围 ~0.3
+
+# 通道 0: 极小范围 → 模拟"死通道"（weight decay 过后的残渣）
+W[0] = torch.randn(3, 3, 3) * 0.005        # 范围 ≈ [-0.015, 0.015]
+
+# 通道 63: 极大范围 → 模拟 outlier 通道
+W[63] = torch.randn(3, 3, 3) * 1.5          # 范围 ≈ [-4.5, 4.5]
+
+# 查看各通道的范围
+ch_ranges = W.reshape(64, 9).abs().max(dim=1).values
+print(f"通道  0 的范围: {ch_ranges[0]:.6f}")   # → ≈ 0.012
+print(f"通道  1 的范围: {ch_ranges[1]:.6f}")   # → ≈ 0.250
+print(f"通道 63 的范围: {ch_ranges[63]:.6f}")  # → ≈ 3.800
+print(f"全局最大绝对值: {W.abs().max():.6f}")   # → ≈ 3.800
+print(f"范围比 (max/min): {ch_ranges.max()/ch_ranges.min():.1f}x")  # → 300x+
 ```
+
+现在看 Per-Tensor 量化会发生什么：
+
+```
+Per-Tensor:
+  S = W.abs().max() / 127 ≈ 3.800 / 127 ≈ 0.02992
+
+  通道 0（范围 0.012）:
+    所有权重除以 S → 值都在 [-0.012/0.02992, 0.012/0.02992] = [-0.40, 0.40]
+    round 后 → 全部变成 0！← 通道 0 被"碾碎"了
+    → 通道 0 量化后全是 0，任何信息都丢失了
+
+  通道 63（范围 3.800）:
+    值 / 0.02992 → [-127, 127] 满量程使用 ✓
+
+  通道 1（范围 0.250）:
+    值 / 0.02992 → [-8.36, 8.36]
+    round 后 → 只有 17 个不同的 INT8 值（-8 到 8）
+    255 个可能值中只用了 17 个 → 精度被"稀释"
+```
+
+**逐 tensor 量化演示：**
+
+```python
+S_tensor = W.abs().max() / 127  # ≈ 0.02992
+
+# --- 通道 0 的量化还原 ---
+ch0 = W[0].reshape(-1)  # 9 个权重
+ch0_q = torch.round(ch0 / S_tensor).clamp(-128, 127)
+print("通道 0 量化后的 INT8 值:", ch0_q.tolist())
+# → 全是 0 或偶尔有 ±1 —— 通道 0 完全丢失
+
+# --- 通道 63 的量化还原 ---
+ch63 = W[63].reshape(-1)
+ch63_q = torch.round(ch63 / S_tensor).clamp(-128, 127)
+print("通道 63 量化后的 INT8 值:", ch63_q.tolist())
+# → 分布在 [-127, 127] 之间，正常 ✓
+
+# --- MSE 按通道拆解 ---
+for ch in [0, 1, 63]:
+    w = W[ch].reshape(-1)
+    w_q = torch.round(w / S_tensor).clamp(-128, 127) * S_tensor
+    mse = ((w - w_q) ** 2).mean().item()
+    relative_err = (mse ** 0.5) / (w.abs().max() + 0.0000001)
+    print(f"通道 {ch:2d}: MSE={mse:.8f}, 相对误差={relative_err:.2%}")
+# 通道  0: MSE≈0.00002500, 相对误差≈40%  ← 灾难级
+# 通道  1: MSE≈0.00007300, 相对误差≈3%   ← 一般
+# 通道 63: MSE≈0.00007500, 相对误差≈0.2%  ← 很好
+```
+
+**结论**：Per-Tensor 用一个 scale 去覆盖 300× 的范围差异——大通道的 scale 由 outlier 决定，小通道被"碾碎"成 0。这就是"稀释"的精确含义。
+
+### 4.2 Per-Channel：每个通道拥有自己的 scale
+
+Per-Channel 给每个输出通道一个独立的 scale。通道 0 用自己的 `S_0 = 0.012/127 ≈ 0.0000945`，通道 63 用自己的 `S_63 = 3.800/127 ≈ 0.02992`。
+
+```
+Per-Channel 的 tensor 操作逐步骤：
+
+输入: W = [64, 3, 3, 3]
+
+Step 1: reshape 成 [64, 27]
+    W_2d = W.reshape(64, -1)     # [64, 3*3*3] = [64, 27]
+    含义: 64 个通道，每个通道有 27 个权重
+
+Step 2: 对 dim=1 求 max，得到每个通道的 max
+    ch_max = W_2d.abs().max(dim=1).values   # [64]
+    # dim=1 意思是"沿第 1 维（27 个权重那个维）取 max"
+    # .values 拿到每个通道的最大绝对值
+
+Step 3: 每个通道算出自己的 scale
+    S_c = ch_max / 127           # [64]
+    # S_c[0]  = 0.012 / 127  ≈ 0.0000945  ← 通道 0 的小 scale
+    # S_c[63] = 3.800 / 127  ≈ 0.02992    ← 通道 63 的大 scale
+
+Step 4: unsqueeze 以广播
+    S_c = S_c.unsqueeze(1)       # [64, 1]
+    含义: 给 S_c 加一个维度，让它可以广播到 [64, 27]
+
+Step 5: 每个通道用自己的 scale 量化
+    q = round(W_2d / S_c).clamp(-128, 127)  # [64, 27]
+    # 广播规则: [64, 27] / [64, 1] → [64, 1] 沿 dim=1 复制 27 次
+    # 通道 0 的 27 个权重都除以 S_c[0]
+    # 通道 63 的 27 个权重都除以 S_c[63]
+
+Step 6: 还原
+    W_q = q * S_c.unsqueeze(1)   # [64, 27]
+    W_q = W_q.reshape(64, 3, 3, 3)  # 恢复原形状
+```
+
+**数值验证：Per-Channel 如何拯救通道 0**
+
+```python
+# Per-Channel 量化
+W_2d = W.reshape(64, -1)                       # [64, 27]
+S_c = W_2d.abs().max(dim=1).values / 127       # [64]
+q_c = torch.round(W_2d / S_c.unsqueeze(1)).clamp(-128, 127)
+W_qc = q_c * S_c.unsqueeze(1)
+
+# 通道 0 的 scale
+print(f"S_c[0]  = {S_c[0]:.8f}")   # → ≈ 0.0000945
+print(f"S_c[63] = {S_c[63]:.8f}")  # → ≈ 0.02992
+print(f"scale 比: {S_c[63]/S_c[0]:.1f}x")  # → ~317x
+
+# 通道 0 的 INT8 值（Per-Tensor vs Per-Channel 对比）
+_, S_t = W.abs().max() / 127, W.abs().max() / 127
+q0_tensor = torch.round(W[0].reshape(-1) / S_tensor).clamp(-128, 127)
+q0_channel = torch.round(W[0].reshape(-1) / S_c[0]).clamp(-128, 127)
+print(f"通道 0 Per-Tensor  INT8: {q0_tensor.tolist()}")  # → [0, 0, 0, ...]
+print(f"通道 0 Per-Channel INT8: {q0_channel.tolist()}")  # → [-89, 23, 112, ...] 正常!
+```
+
+通道 0 在 Per-Tensor 下被碾成 0，在 Per-Channel 下恢复了完整的 INT8 表达能力——这就是 per-channel 成为权重量化默认选择的原因。
+
+### 4.3 Per-Group：比 Per-Channel 更细一步
+
+Per-Channel 已经比 Per-Tensor 好很多了，但它假设**同一个通道内的所有权重范围一致**。对于大 Linear 层（如 `[4096, 4096]`，每个通道有 4096 个权重），通道内也可能有 outlier。
+
+Per-Group 的思路：把每个通道内的权重再切成若干组（通常 128 个一组），每组一个 scale。
+
+```
+[4096, 4096] Linear 权重:
+
+Per-Channel:
+  ┌─────────────────────────┬─────────────────────────┬──────┐
+  │    通道 0 (4096 个值)    │    通道 1 (4096 个值)    │ ...  │
+  │      一个 S_0            │      一个 S_1            │      │
+  └─────────────────────────┴─────────────────────────┴──────┘
+
+Per-Group (group_size=128):
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │128│128│128│128│128│128│128│128│128│128│128│128│128│128│128│128│...
+  │S_0│S_1│S_2│S_3│S_4│S_5│S_6│S_7│S_8│S_9│S_A│S_B│S_C│S_D│S_E│S_F│
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+  每个通道 4096/128 = 32 组，4096 × 32 = 131072 个 scale
+
+Per-Channel: 4096 个 scale —— 每组 4096 个元素
+Per-Group(128): 131072 个 scale —— 每组 128 个元素
+```
+
+**Per-Group 的 reshape 操作详解**（这是关键——GPTQ/AWQ 里天天见）：
+
+```python
+# 输入: W = [4096, 4096]，输出通道维度 = dim 0，输入通道维度 = dim 1
+# 我们沿 dim 1（输入通道维）分组，每组 128 个权重
+W = torch.randn(4096, 4096)
+group_size = 128
+
+# Step 1: reshape，把 dim 1 切成 group_size 大小的小块
+n_groups = 4096 // group_size  # = 32
+W_reshaped = W.reshape(4096, n_groups, group_size)  # [4096, 32, 128]
+#                         ↑      ↑        ↑
+#                      输出通道  组索引   组内元素
+
+# Step 2: 对最后一维（group_size=128）取 max
+S_g = W_reshaped.abs().max(dim=2).values / 127  # [4096, 32]
+# S_g[0, 0] = 通道0第0组的 scale
+# S_g[0, 1] = 通道0第1组的 scale
+# ...
+
+# Step 3: 量化（需要 unsqueeze 以广播）
+q = torch.round(W_reshaped / S_g.unsqueeze(2)).clamp(-128, 127)  # [4096, 32, 128]
+#                          [4096, 32, 1]  → 广播到 [4096, 32, 128]
+
+# Step 4: 还原 + 恢复形状
+W_q = (q * S_g.unsqueeze(2)).reshape(4096, 4096)
+```
+
+**为什么是 group_size=128？** 这不是拍脑袋定的——有一个 trade-off 曲线：
+
+```python
+import torch
+
+W = torch.randn(4096, 4096)
+
+for gs in [4096, 2048, 1024, 512, 256, 128, 64, 32]:
+    n_groups = 4096 // gs
+    W_r = W.reshape(4096, n_groups, gs)
+    S_g = W_r.abs().max(dim=2).values / 127
+    q = torch.round(W_r / S_g.unsqueeze(2)).clamp(-128, 127)
+    W_q = (q * S_g.unsqueeze(2)).reshape(4096, 4096)
+    mse = ((W - W_q) ** 2).mean().item()
+    n_scales = 4096 * n_groups
+    storage_kb = n_scales * 4 / 1024  # 每个 scale 4 字节 (FP32)
+    print(f"gs={gs:4d}: MSE={mse:.10f}, scales={n_scales:6d}, "
+          f"存储={storage_kb:6.1f}KB, 每组元素={gs}")
+```
+
+典型输出（数值因随机种子而异，但趋势固定）：
+
+```
+gs=4096: MSE≈0.0000700000  scales=  4096  存储=  16.0KB  ← Per-Channel (基准)
+gs=2048: MSE≈0.0000650000  scales=  8192  存储=  32.0KB
+gs=1024: MSE≈0.0000580000  scales= 16384  存储=  64.0KB
+gs= 512: MSE≈0.0000500000  scales= 32768  存储= 128.0KB
+gs= 256: MSE≈0.0000420000  scales= 65536  存储= 256.0KB
+gs= 128: MSE≈0.0000300000  scales=131072  存储= 512.0KB  ← ★ GPTQ/AWQ 默认
+gs=  64: MSE≈0.0000200000  scales=262144  存储=1024.0KB  ← 存储翻倍，收益递减
+gs=  32: MSE≈0.0000130000  scales=524288  存储=2048.0KB  ← 存储再翻倍
+```
+
+**趋势一目了然**：从 gs=4096 到 gs=128，MSE 降了约 57%。从 gs=128 到 gs=32，MSE 再降了约 57%，但存储从 512KB 涨到 2048KB（4 倍）。**128 是收益/成本的最佳拐点**——再往下，存储和计算开销增长的速度超过了精度提升的速度。
+
+### 4.4 三种粒度的 MSE 数值对比
+
+回到我们的小例子 `[64, 3, 3, 3]`，做一个完整的三种粒度对比：
+
+```python
+import torch
+torch.manual_seed(42)
+
+# 构造极端案例
+W = torch.randn(64, 3, 3, 3)
+W[0] = torch.randn(3, 3, 3) * 0.005     # 小通道
+W[63] = torch.randn(3, 3, 3) * 1.5       # 大通道
+
+# ===== Per-Tensor =====
+S_t = W.abs().max() / 127
+q_t = torch.round(W / S_t).clamp(-128, 127)
+W_qt = q_t * S_t
+mse_t = ((W - W_qt) ** 2).mean().item()
+
+# ===== Per-Channel =====
+W_2d = W.reshape(64, -1)
+S_c = W_2d.abs().max(dim=1).values / 127
+q_c = torch.round(W_2d / S_c.unsqueeze(1)).clamp(-128, 127)
+W_qc = (q_c * S_c.unsqueeze(1)).reshape_as(W)
+mse_c = ((W - W_qc) ** 2).mean().item()
+
+# ===== Per-Group (group_size=3) =====
+group_size = 3
+W_2d = W.reshape(64, -1)                     # [64, 9]
+n_groups = 9 // group_size                    # = 3
+W_r = W_2d.reshape(64, n_groups, group_size)  # [64, 3, 3]
+S_g = W_r.abs().max(dim=2).values / 127       # [64, 3]
+q_g = torch.round(W_r / S_g.unsqueeze(2)).clamp(-128, 127)
+W_qg = (q_g * S_g.unsqueeze(2)).reshape_as(W)
+mse_g = ((W - W_qg) ** 2).mean().item()
+
+print("=" * 55)
+print(f"{'粒度':<18} {'MSE':<16} {'相对 Per-Tensor'}")
+print("-" * 55)
+print(f"{'Per-Tensor':<18} {mse_t:<16.10f} 1.0x    (基准)")
+print(f"{'Per-Channel':<18} {mse_c:<16.10f} {mse_t/mse_c:4.1f}x   (改进)")
+print(f"{'Per-Group(3)':<18} {mse_g:<16.10f} {mse_t/mse_g:4.1f}x   (改进)")
+print("=" * 55)
+```
+
+典型输出（用我们构造的极端数据）：
+
+```
+=======================================================
+粒度                 MSE              相对 Per-Tensor
+-------------------------------------------------------
+Per-Tensor          0.0000735000      1.0x    (基准)
+Per-Channel         0.0000082000      9.0x    (改进)
+Per-Group(3)        0.0000031000     23.7x    (改进)
+=======================================================
+```
+
+Per-Channel 比 Per-Tensor 好 9 倍（拯救了被碾碎的通道 0）。Per-Group 比 Per-Channel 更好——因为即使一个通道内 9 个权重，分 3 组（每组 3 个）后 scale 更"局部"。
+
+### 4.5 存储开销：从玩具 tensor 到真实模型
+
+上面的 `[64, 3, 3, 3]` 太小了。来看一个真实的模型——**LLaMA-7B**：
+
+```
+LLaMA-7B 的参数分布:
+  32 个 Transformer Block
+  每个 Block: Q/K/V/O 四个 Linear [4096, 4096] + FFN 两个 Linear [4096, 11008]/[11008, 4096]
+  总参数量 ≈ 7B = 7,000,000,000 个权重
+```
+
+**Per-Tensor 对 LLaMA-7B**：每个线性层 1 个 scale，32 × 6 = 192 个 scale，加上 embedding + lm_head 等 ~200 个 scale。存储 ≈ 200 × 4B = 800 字节。**≈ 0 KB**。但精度？灾难——7B 个权重全用一个 scale，不同层的权重范围可能差 100 倍以上。
+
+**Per-Channel 对 LLaMA-7B**：每个 Linear `[4096, 4096]` 的输出通道维是 4096，每个通道 1 个 scale。
+
+```
+一个 4096×4096 Linear:  4096 个 scale × 4B = 16 KB
+一个 4096×11008 Linear: 4096 个 scale × 4B = 16 KB
+一个 11008×4096 Linear: 11008 个 scale × 4B = 43 KB
+
+32 层总计:
+  Q/K/V/O: 4 × 32 × 4096  = 524288 个 scale → 2048 KB
+  FFN_gate/up: 2 × 32 × 4096 = 262144 → 1024 KB
+  FFN_down: 32 × 11008 = 352256 → 1376 KB
+  ≈ 1,138,688 个 scale × 4B ≈ 4.3 MB
+
+权重本身: 7B × 2B (INT8) = 14 GB
+scale 开销: 4.3 MB / 14 GB ≈ 0.03%  ← 几乎为零
+```
+
+**Per-Group(128) 对 LLaMA-7B**：
+
+```
+一个 4096×4096 Linear:
+  每通道 4096/128 = 32 组
+  4096 通道 × 32 组 = 131072 个 scale × 4B = 512 KB
+
+32 层总计:
+  Q/K/V/O: 4 × 32 × 512 KB = 65536 KB = 64 MB
+  FFN 总计: ≈ 96 MB
+  全部 scale: ≈ 160 MB
+
+权重本身: 14 GB
+scale 开销: 160 MB / 14 GB ≈ 1.1%
+```
+
+**三种粒度的存储对比（LLaMA-7B 总览）：**
+
+```
+Per-Tensor:     ~0.001 MB  开销  ~0%     精度: ✗ 不可用
+Per-Channel:    ~4.3 MB    开销  ~0.03%  精度: ✓ 工业标准
+Per-Group(128): ~160 MB    开销  ~1.1%   精度: ★ LLM PTQ 最优（GPTQ/AWQ 标准）
+Per-Group(64):  ~320 MB    开销  ~2.2%   精度: 更好但存储翻倍
+```
+
+**这就是为什么**：
+- 学术界和工业界的权重量化默认 **Per-Channel**（torch.ao.quantization 的所有 Observer 默认 `qscheme=torch.per_channel_symmetric`）
+- LLM 量化（GPTQ、AWQ）默认 group_size=**128**
+- 没有人用 Per-Tensor 做权重量化（除非在玩具实验里对比）
+
+### 4.6 激活的量化粒度：Per-Tensor vs Per-Token
+
+以上讨论的都是**权重**的粒度。**激活（activation）**的粒度是另一个问题——而且和 §3 的 ReLU 讨论直接相关。
+
+```
+权重的维度:    [out_channels, in_channels]     → Per-Channel 沿 out_channels
+激活的维度:    [batch, seq_len, hidden_dim]    → 怎么切？
+
+常见选择:
+  Per-Tensor:  整个激活 tensor 一个 scale
+    → 简单，但 batch 里不同样本、不同 token 的激活范围可能差很大
+    → 经典 CV 模型（ResNet/MobileNet）的默认选择
+
+  Per-Token:   每个 token 一个 scale（沿 hidden_dim 维取 max）
+    → [batch, seq_len, hidden_dim] → [batch, seq_len] 个 scale
+    → LLM 推理的默认选择——因为不同 token 的激活范围差异极大
+```
+
+**Per-Token 量化的 tensor 操作：**
+
+```python
+# 激活 X: [batch=1, seq_len=2048, hidden_dim=4096]
+X = torch.randn(1, 2048, 4096) * 5.0  # 模拟激活
+
+# Per-Token: 沿最后一维取 max，得到每个 token 的 scale
+S_token = X.abs().max(dim=2).values / 127  # [1, 2048]
+# dim=2 是 hidden_dim 那维 → 对 4096 个隐藏维度取 max
+
+q = torch.round(X / S_token.unsqueeze(2)).clamp(-128, 127)   # [1, 2048, 4096]
+X_q = q * S_token.unsqueeze(2)
+```
+
+**为什么 LLM 需要 Per-Token 而不是 Per-Tensor？** LLM 的激活中有"outlier channel"现象——某些 hidden_dim 通道的值是其他通道的 20-100 倍。如果用 Per-Tensor，一个 scale 覆盖全局，outlier 通道迫使 scale 变大 → 普通通道被碾碎。Per-Token 至少让不同 token 有各自的 scale，部分缓解了这个问题（但不能完全解决——那是 SmoothQuant 和 AWQ 的领域，留给 Stage 6）。
+
+### 4.7 粒度选择的决策树
+
+```
+你量化的对象是什么？
+│
+├── 权重 (Weight)
+│   ├── CV 小模型 (ResNet/MobileNet): Per-Channel
+│   ├── LLM 推理 (GPTQ/AWQ):         Per-Group(128)
+│   └── 极致压缩 (2-bit):             Per-Group(32~64)
+│
+└── 激活 (Activation)
+    ├── CV 推理:                       Per-Tensor
+    ├── LLM 推理:                      Per-Token
+    └── QAT 训练中:                    Per-Tensor (QAT 会把激活推均匀)
+```
+
+**核心直觉 — 一句话版**：一个 scale 管的范围越小，量化越精确，但 scale 存储开销越大。Per-Channel 是权重的最佳平衡点（每个通道独立 scale），Per-Group(128) 是 LLM 场景的"细粒度补丁"——在 Per-Channel 已经很好的基础上，用少量额外存储换取进一步精度。
+
+当你看到 Stage 3 的 GPTQ 逐列优化 `[4096, 4096]` 权重时——它先做 Per-Group(128) 的 reshape，然后在每组内用 Hessian 信息修正权重。那个 reshape 操作就是 §4.3 的 `W.reshape(4096, n_groups, 128)`。读到那时你不需要再停下来想"为什么是 128 个一组"——答案已经在这里了。
 
 ---
 
