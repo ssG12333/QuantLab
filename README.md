@@ -138,19 +138,23 @@ QuantLab/
 
 ## 当前进度 / Current Progress
 
-| 阶段 / Stage | 状态 | 完成日 |
-|------|:--:|--------|
-| Stage 0 · 量化基础（纯理论） | ✅ | 2026-07-10 |
-| Stage 1 · PyTorch 量化全景 | ✅ | 2026-07-13 |
-| Stage 1.5 · QAT 训练深度剖析 | ✅ | 2026-07-13 |
-| Stage 2 · LSQ 核心算法 | ✅ | 2026-07-13 |
-| Stage 3 · PTQ 进阶算法 | ✅ | 2026-07-20 |
-| Stage 4 · YOLO 量化实战 | 📋 | — |
-| Stage 5 · PPQ + AIMET | 📋 | — |
-| Stage 6 · 大模型 PTQ | 📋 | — |
-| Stage 7 · 大模型 QAT | 📋 | — |
-| Stage 8 · 端侧部署 | 📋 | — |
-| Stage 9 · 前沿追踪 | 🔄 | — |
+> **🔧 当前阶段：前期内容重构中** —— 搭好骨架之后，逐节"填肉"。
+> Stages 0-3 已完成初版，正在按统一标准（tensor 级操作、源码拆解、数学+代码互验）逐节扩充，
+> 把每个概念从"能看懂"升级到"能复现每一步"。这也是为什么 Stage 0/1 的 commit 记录还在持续增长。
+
+| 阶段 / Stage | 状态 | 说明 |
+|------|:--:|------|
+| Stage 0 · 量化基础 | ✅ 已重构 | 基础理论扎实 → 逐节扩充中（§3/§4 已深化） |
+| Stage 1 · PyTorch 量化全景 | ✅ 已重构 | PT2E 五步管线 + Observer/Quantizer 已补齐 |
+| Stage 1.5 · QAT 训练深度剖析 | ✅ 已重构 | 手写→消融→崩溃→引出LSQ 链条完整 |
+| Stage 2 · LSQ 核心算法 | ✅ 已重构 | STE + 公式(6)(13) + LSQ+ 完整实现 |
+| Stage 3 · PTQ 进阶算法 | ✅ 已重构 | AdaRound/FlexRound/CLE/GPTQ |
+| Stage 4 · YOLO 量化实战 | 📋 待开始 | — |
+| Stage 5 · PPQ + AIMET | 📋 待开始 | — |
+| Stage 6 · 大模型 PTQ | 📋 待开始 | — |
+| Stage 7 · 大模型 QAT | 📋 待开始 | — |
+| Stage 8 · 端侧部署 | 📋 待开始 | — |
+| Stage 9 · 前沿追踪 | 🔄 持续更新 | — |
 
 <br>
 
