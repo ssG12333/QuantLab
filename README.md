@@ -17,9 +17,9 @@
 
 ## 这是什么？ / What is this?
 
-一套面向 **模型量化 (Model Quantization)** 的自学笔记，适合已经知道 PTQ/QAT 大致原理、但**不满足于"能调 API"**、想下沉到框架源码级别理解的人。
+一套面向 **模型量化 (Model Quantization)** 的自学笔记，适合有深度学习基础、想系统入门模型压缩与优化的同学。这里不讲"调包即用"——每一行代码都有对应的数学推导和框架源码级拆解，目标是让你**真正看懂工具链在做什么**。
 
-*A self-study notebook on model quantization, for those who already know the basics of PTQ/QAT but want to go deeper — reading framework source code, not just calling APIs.*
+*A self-study notebook on model quantization — for those with DL foundations who want to master model compression & optimization. No "call the API and move on" — every line of code is backed by math and framework source-level breakdown. The goal is to understand what the toolchain actually does.*
 
 我自己的背景：对深度学习基础懂个六七成（Sigmoid 查表、ONNX 图优化、端侧部署），但知识比较散。这个仓库是我**从 YOLO 练手到 LLaMA 量化**的完整学习记录。
 
