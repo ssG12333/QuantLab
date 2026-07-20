@@ -17,9 +17,9 @@
 7. [6. 完整 tensor 数据流追踪：一个 batch 穿过 QAT 图的全过程](#6-完整-tensor-数据流追踪)
 8. [7. 四种 QuantizationSpec 完整拆解 🆕](#7-四种-quantizationspec-完整拆解)
 9. [8. Tensor 级操作：从 FQ 节点到 C++ 内核 🆕](#8-tensor-级操作从-fq-节点到-c-内核)
-10. [9. Observer / FakeQuantize 核心模块](#9-observer--fakequantize-核心模块)
+10. [9. Observer / FakeQuantize 核心模块](#9-observer--fakequantize-核心模块) — 含 tensor 级生命周期
 11. [10. fuse_modules：Conv+BN 融合](#10-fuse_modulesconvbn-融合)
-12. [11. QConfigMapping 与 Quantizer 体系](#11-qconfigmapping-与-quantizer-体系)
+12. [11. Quantizer 深度拆解：PT2E 的"量化大脑" 🆕](#11-quantizer-深度拆解pt2e-的量化大脑)
 13. [12. 三种模式对比：Eager / FX / PT2E](#12-三种模式对比eager--fx--pt2e)
 14. [13. QAT 训练实战技巧](#13-qat-训练实战技巧)
 15. [14. 动手实验](#14-动手实验)
@@ -1426,6 +1426,160 @@ Phase 3 (eval):           Inference/Eval
   model.eval()             → BN 用 running stats
 ```
 
+### 9.6 Observer 的 tensor 级操作与完整生命周期
+
+上面讲了 Observer 的"类结构"和 FakeQuantize 的"状态机"。这一节下沉到 tensor 级别——**一个 Observer 实例从创建到销毁，对穿过它的 tensor 做了什么**。
+
+**Observer.forward() 的逐行拆解**：
+
+```python
+# 假设一个 MovingAverageMinMaxObserver 实例，observer_enabled=1
+# 输入: x_orig [1, 64, 32, 32] FP32，来自上层 Conv 的输出
+
+def forward(self, x_orig):
+    # Step 1: detach — 切断 min/max 更新的梯度链
+    x = x_orig.detach()
+    # ★ 为什么 detach？min/max 的更新是"统计量收集"，不需要反向传播
+    #   如果 x 连着计算图，min() 和 max() 操作也会被 autograd 追踪
+    #   → 不需要计算 min 的梯度（min 不可导），detach 后更清晰
+
+    # Step 2: 更新 min/max
+    if self.qscheme == per_tensor_affine:
+        # per-tensor: 取整个 tensor 的 min/max
+        min_cur = x.min()    # 标量
+        max_cur = x.max()    # 标量
+        if self.averaging_constant > 0:
+            # EMA 更新: new = old + α × (observed - old)
+            self.min_val += self.averaging_constant * (min_cur - self.min_val)
+            self.max_val += self.averaging_constant * (max_cur - self.max_val)
+        else:
+            self.min_val = min_cur
+            self.max_val = max_cur
+
+    elif self.qscheme == per_channel_symmetric:
+        # per-channel: dim 0 是 channel，沿其余 dim 取 min/max
+        x_flat = x.reshape(x.shape[0], -1)              # [64, 1024]
+        min_cur = x_flat.min(dim=1).values              # [64] 每通道的 min
+        max_cur = x_flat.max(dim=1).values              # [64] 每通道的 max
+        # EMA 更新同上...
+
+    # Step 3: 返回原始输入 — 不修改!
+    return x_orig
+    # ★ 关键设计: Observer 是"透明的" — 下游 op 完全不知道 Observer 的存在
+    #   Observer 只做统计收集, 不改变 tensor 的值
+    #   实际量化注入是 FakeQuantize (继承自 Observer) 在 fake_quant_enabled=1 时做的事
+```
+
+**Observer 收集到的数据长什么样**：
+
+```python
+# 不同 Observer 的 min_val / max_val 的 shape
+
+# MinMaxObserver (per-tensor):
+min_val = tensor(-1.2345)  # 标量 — 一个值管所有元素
+max_val = tensor(3.4567)
+
+# PerChannelMinMaxObserver (per-channel, 64 通道):
+min_val = tensor([-1.2, -0.5, ..., -0.3])  # [64] — 每通道一个
+max_val = tensor([3.4, 2.1, ..., 1.8])
+
+# MovingAverageMinMaxObserver (per-tensor, EMA):
+# 每个 batch forward 后 min_val/max_val 被 EMA 公式更新
+# 初始值 = inf/-inf → 第 1 个 batch: min_val = observed_min (直接赋值)
+# 第 2 个 batch: min_val = old + α × (new - old) → 平滑过渡
+```
+
+**Observer 的完整生命周期**：
+
+```
+Phase 1: CREATION — prepare_qat_pt2e 内部
+─────────────────────────────────────────
+  prepare() 读取 QuantizationSpec.observer_or_fake_quant_ctr
+  → 创建 Observer 实例 (如 MinMaxObserver.with_args(dtype=torch.quint8))
+  → graph_module.add_submodule("activation_post_process_0", obs)
+  → 在图边插入 call_module("activation_post_process_0")
+  → 状态: observer_enabled=1, fake_quant_enabled=1 (QAT 默认都开)
+
+Phase 2: CALIBRATION — QAT 前 2-3 epoch
+─────────────────────────────────────────
+  每个 batch forward:
+    obs.forward(tensor) →
+      - 更新 min_val / max_val (EMA 平滑)
+      - calculate_qparams() 重新计算 scale / zero_point
+      - 如果 fake_quant_enabled=1: 用新 scale 做 fake_quantize → 返回离散化 tensor
+      - 返回的 tensor 只有 256 个可能值 (INT8) 或更少 (低比特)
+  关键: scale 每个 batch 都在更新! 这个阶段 weight 暴露在不断变化的量化噪声下
+
+Phase 3: FREEZE — QAT 剩余 epoch
+─────────────────────────────────────────
+  model.apply(disable_observer) → observer_enabled=0
+  每个 batch forward:
+    obs.forward(tensor) →
+      - min_val / max_val 不再更新 ← scale 冻住了!
+      - calculate_qparams() 用冻结后的 scale (保持不变)
+      - fake_quant_enabled=1 → 量化噪声还在 (但用的是固定的 scale)
+  关键: weight 现在学习适应一个稳定的量化网格 (不是每次 batch 都变)
+
+Phase 4: CONVERT — convert_pt2e 内部
+─────────────────────────────────────────
+  convert_pt2e 遍历所有 call_module(FQ) 节点:
+    - 读取 scale, zero_point 从 Observer buffer 中取出 (最终固定值)
+    - 删除 Observer 模块
+    - 替换为: quantize → dequantize 操作对 (用取出的 scale/zp)
+  Observer 实例被释放 → 存在的证据只剩图里的 Q/DQ 节点
+```
+
+**Observer 在 PTQ vs QAT 中的不同行为**：
+
+```
+PTQ (prepare_pt2e):
+  Observer = 纯统计收集器
+  - observer_enabled=1, fake_quant_enabled=0 (永远不做 fake_quant!)
+  - 校准阶段: 跑 N 个 batch → Observer 收集 min/max → 算出 scale/zp
+  - 没有 QAT 训练 → Observer 不会再次更新
+  - convert_pt2e: Observer 的 scale/zp → Q/DQ 节点
+
+QAT (prepare_qat_pt2e):
+  Observer → 升级为 FakeQuantize
+  - observer_enabled=1, fake_quant_enabled=1 (两个都开!)
+  - 校准阶段: Observer 更新 scale + FakeQuant 注入噪声
+  - QAT 训练: Observer 冻结, FakeQuant 继续注入噪声
+  - convert_pt2e: FakeQuantize 的 scale/zp → Q/DQ 节点
+
+关键差异: PTQ 从来没有 fake_quant — 校准完直接转换
+         QAT 有完整的 fake_quant — 模型训练在量化噪声下
+```
+
+**Observer 在 PT2E 图中的位置 — 一个具体例子**：
+
+```
+prepare 后的图 (MiniModel, 简化):
+
+  %x (placeholder, [1,3,32,32])
+    ↓
+  %fq_act_0 : call_module[activation_post_process_0] (%x)
+    │  ↑ 这个模块是 FakeQuantize(MinMaxObserver)
+    │  ↑ observer_enabled=1 → 每个 batch 更新 min_val/max_val
+    │  ↑ fake_quant_enabled=1 → 量化噪声注入
+    │  ↑ output = fake_quantize_per_tensor_affine(x, scale, zp, -128, 127)
+    ↓
+  %x_q : [1,3,32,32] FP32, 256 个离散值
+    ↓
+  %conv2d : call_function[aten.conv2d] (%x_q, %w_q, %bias)
+    ↓
+  %fq_act_1 : call_module[activation_post_process_1] (%conv2d)
+    │  ↑ 另一个 Observer 实例 — 独立的 min_val/max_val!
+    │  ↑ 这一层激活的 scale 和上一层不同 (数据分布不同)
+    ↓
+  %y_q : [1,64,32,32] FP32, 256 个离散值
+    ↓
+  ...
+
+每个 call_module(FQ) 节点 = 一个独立的 Observer 实例
+每个实例有自己的 min_val / max_val / scale / zero_point
+不同层的 scale 可以完全不同 — 这就是量化能"自适应"各层分布的关键
+```
+
 ---
 
 ## 10. fuse_modules：Conv+BN 融合
@@ -1496,74 +1650,330 @@ gm = capture_pre_autograd_graph(model, example_input)
 
 ---
 
-## 11. QConfigMapping 与 Quantizer 体系
+## 11. Quantizer 深度拆解：PT2E 的"量化大脑"
 
-### 11.1 QConfigMapping（FX Mode 使用）
+PT2E 用 `Quantizer` 替代 FX Mode 的 `QConfigMapping`。但 Quantizer 不只是"配置替换"——
+它是一个完整的**图分析 + 标注引擎**。这节把它从 API 到内部实现彻底拆开。
 
-精细化控制：哪些层用哪种 Observer、哪些层不量化。
+> 注：QConfigMapping（FX Mode 使用）的 API 可参考 [§11 的旧版本](./QConfigMapping)，本章聚焦 PT2E 的 Quantizer。
+
+### 11.1 Quantizer 的完整 API
 
 ```python
-from torch.ao.quantization import QConfigMapping, QConfig
-from torch.ao.quantization.observer import (
-    HistogramObserver, PerChannelMinMaxObserver,
-    MovingAverageMinMaxObserver,
-)
+from torch.ao.quantization.quantizer import Quantizer
 
-qmap = QConfigMapping()
-# 全局默认
-qmap.set_global(QConfig(
-    activation=HistogramObserver.with_args(dtype=torch.quint8),
-    weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8,
-          qscheme=torch.per_channel_symmetric),
-))
-# 第一层不量化（保持 FP32 输入）
-qmap.set_module_name("conv1", None)
-# 最后一层不量化（保持 FP32 logits）
-qmap.set_module_name("fc", None)
-# 特定类型用特定配置
-qmap.set_object_type(nn.Linear, QConfig(
-    activation=MovingAverageMinMaxObserver.with_args(dtype=torch.quint8),
-    weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8,
-          qscheme=torch.per_channel_symmetric),
-))
-# 正则匹配
-qmap.set_module_name_regex("layer[34].*conv.*", QConfig(
-    activation=HistogramObserver.with_args(dtype=torch.quint8),
-    weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8,
-          qscheme=torch.per_channel_symmetric),
-))
+class Quantizer(ABC):
+    """PT2E 的量化标注引擎 — 基类定义了三个核心方法"""
 
-# 优先级: 精确名 > 正则 > 类型 > 全局
+    def transform_for_annotation(self, model: GraphModule) -> GraphModule:
+        """Step 1 (可选): 在标注前对图做预处理变换
+        例如: XNNPACKQuantizer 在这里融合 Conv+BN 模式
+        如果不 override → 什么都不做
+        """
+        return model
+
+    def annotate(self, model: GraphModule) -> GraphModule:
+        """Step 2 (必须): 遍历图节点, 给每条边打上 QuantizationSpec 标注
+        核心逻辑: 对每个 call_function 节点, 根据 op 类型决定:
+          - input[0] 需要什么 Spec  (新建/共享/推导/固定?)
+          - input[1] 需要什么 Spec
+          - output 需要什么 Spec
+        标注存储在 node.meta["quantization_annotation"] 中
+        """
+        raise NotImplementedError
+
+    def validate(self, model: GraphModule) -> None:
+        """Step 3 (可选): 验证标注是否正确
+        例如: XNNPACKQuantizer 检查没有未标注的 op、没有冲突的共享 Spec
+        如果不 override → 什么都不做
+        """
+        pass
 ```
 
-### 11.2 Quantizer（PT2E 使用）
-
-PT2E 用 `Quantizer` 替代 `QConfigMapping`。换后端 = 换 Quantizer。
+**三个方法在 prepare 中的调用顺序**：
 
 ```python
-from torch.ao.quantization.quantizer.xnnpack_quantizer import (
-    XNNPACKQuantizer, get_symmetric_quantization_config,
-)
+# quantize_pt2e.py: prepare_qat_pt2e 内部
 
-quantizer = XNNPACKQuantizer()
+def prepare_qat_pt2e(model, quantizer):
+    # Step 1: 预处理 (可选)
+    quantizer.transform_for_annotation(model)
+    # Step 2: 标注 (核心)
+    quantizer.annotate(model)
+    # Step 3: 验证 (可选)
+    quantizer.validate(model)
+    # Step 4: FQ 插入 (由 prepare.py 执行, 不归 Quantizer 管)
+    model = prepare(model, node_name_to_scope, is_qat=True)
+    return model
+```
 
-# 全局配置
-quantizer.set_global(
-    get_symmetric_quantization_config(is_qat=True)
-)
+### 11.2 annotate() 的内部工作机制
 
-# 按 op 类型配置
-from torch.ao.quantization.quantizer import Quantizer
-quantizer.set_object_type(
-    torch.nn.Conv2d,
-    get_symmetric_quantization_config(is_qat=True, is_per_channel=True)
-)
+`annotate()` 是 Quantizer 的核心——它遍历图中的**每个节点**，对节点的**每条输入边**做标注决策。
 
-# 按模块名配置
-quantizer.set_module_name(
-    "conv1",
-    get_symmetric_quantization_config(is_qat=True)
+**遍历图的逻辑**：
+
+```python
+class XNNPACKQuantizer(Quantizer):
+    def annotate(self, model: GraphModule) -> GraphModule:
+        for node in model.graph.nodes:
+            # 只处理 call_function 节点 (ATen op 调用)
+            #   placeholder (输入) — 不标注
+            #   get_attr (参数) — 不标注 (参数被消费它的 op 标注)
+            #   output — 不标注
+            if node.op != 'call_function':
+                continue
+
+            # ★ 核心分派: 根据 node.target (ATen op 类型) 决定标注策略
+            if node.target in CONV_OPS:
+                self._annotate_conv(node)
+            elif node.target in LINEAR_OPS:
+                self._annotate_linear(node)
+            elif node.target == torch.ops.aten.add.Tensor:
+                self._annotate_add(node)
+            elif node.target == torch.ops.aten.cat.default:
+                self._annotate_cat(node)
+            elif node.target in PASSTHROUGH_OPS:
+                continue  # ReLU, MaxPool 等 — 不标注
+            elif node.target in FIXED_SCALE_OPS:
+                self._annotate_fixed_scale(node)
+            # 未匹配的 op → 不标注 (保守策略: 未知 op 不量化)
+```
+
+**标注存储格式**：
+
+```python
+# node.meta["quantization_annotation"] = QuantizationAnnotation(
+#     input_qspec_map={
+#         node.args[0]: QuantizationSpec(...),    # input[0] 的 Spec
+#         node.args[1]: SharedQuantizationSpec(...),  # input[1] 共享
+#         node.args[2]: DerivedQuantizationSpec(...), # bias 推导
+#     },
+#     output_qspec=QuantizationSpec(...),  # 输出边 (可选)
+#     _annotated=True,
+# )
+```
+
+**具体标注过程 — Conv2d 为例**：
+
+```python
+def _annotate_conv(self, node):
+    """对 aten.conv2d(input, weight, bias, ...) 的三个参数标注"""
+    act_qspec = QuantizationSpec(
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,     # 激活: per-tensor
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(...),
+    )
+    wt_qspec = QuantizationSpec(
+        dtype=torch.int8,
+        qscheme=torch.per_channel_symmetric,  # 权重: per-channel!
+        observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(...),
+    )
+    bias_qspec = DerivedQuantizationSpec(
+        derived_from=[(node, node.args[0]), (node, node.args[1])],
+        derive_qparams_fn=derive_bias_qparams,
+        dtype=torch.int32,
+    )
+
+    # 写入标注
+    annotate_edge(node, 0, act_qspec)   # input activation → 新建 FQ
+    annotate_edge(node, 1, wt_qspec)    # weight → 新建 per-channel FQ
+    annotate_edge(node, 2, bias_qspec)  # bias → 推导
+```
+
+**具体标注过程 — Add 为例**：
+
+```python
+def _annotate_add(self, node):
+    """对 aten.add(a, b) 的两个输入标注 — 第二个共享第一个的 FQ"""
+    annotate_edge(node, 0, QuantizationSpec(...))     # input[0] → 新建 FQ
+    annotate_edge(node, 1, SharedQuantizationSpec(     # input[1] → 共享!
+        edge_or_node=(node, node.args[0])             # "和 input[0] 共享"
+    ))
+```
+
+### 11.3 分派表：Quantizer 怎么识别不同 op
+
+PT2E 图里的节点是 call_function，`node.target` 就是 ATen op。Quantizer 通过匹配 `node.target` 来识别 op 类型：
+
+```python
+# XNNPACKQuantizer 的 op 分派表 (简化版)
+
+CONV_OPS = [
+    torch.ops.aten.conv2d.default,
+    torch.ops.aten.conv1d.default,
+    torch.ops.aten.conv_transpose2d.default,
+]
+
+LINEAR_OPS = [
+    torch.ops.aten.linear.default,
+    torch.ops.aten.addmm.default,      # Linear 的 ATen 底层形式
+]
+
+ADD_LIKE = [
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.mul.Tensor,
+]
+
+# ★ 关键: capture 后的图用 ATen op 而非 nn.Module!
+# conv2d → torch.ops.aten.conv2d.default
+# ReLU  → torch.ops.aten.relu.default
+# Add   → torch.ops.aten.add.Tensor
+```
+
+### 11.4 set_global / set_object_type / set_module_name 怎么工作的
+
+用户调用 `quantizer.set_global(config)` 时，Quantizer 把这些"规则"存起来：
+
+```python
+class XNNPACKQuantizer(Quantizer):
+    def __init__(self):
+        self.global_config = None
+        self.object_type_configs = {}      # {nn.Conv2d: config}
+        self.module_name_configs = {}      # {"conv1": config}
+
+    def set_global(self, config):
+        self.global_config = config
+
+    def set_object_type(self, obj_type, config):
+        self.object_type_configs[obj_type] = config
+
+    def set_module_name(self, name, config):
+        self.module_name_configs[name] = config
+
+    # annotate() 中使用这些配置:
+    def annotate(self, model):
+        for node in model.graph.nodes:
+            # Step 1: 根据 node.target 映射回 nn.Module 类型 (通过 node.meta)
+            nn_module_stack = node.meta.get("nn_module_stack", {})
+            module_type = self._get_module_type(nn_module_stack)
+
+            # Step 2: 按优先级查找配置
+            #   精确名 > 正则 > 类型 > 全局
+            config = self._resolve_config_for_node(node, module_type)
+
+            # Step 3: 用 config 标注
+            if config:
+                self._annotate_node(node, config)
+```
+
+**优先级链的解析逻辑**：
+
+```python
+def _resolve_config_for_node(self, node, module_type):
+    # 1. 精确模块名 → 最高优先级
+    module_name = self._get_module_name(node)
+    if module_name in self.module_name_configs:
+        return self.module_name_configs[module_name]
+
+    # 2. 按对象类型 (nn.Conv2d / nn.Linear 等)
+    if module_type in self.object_type_configs:
+        return self.object_type_configs[module_type]
+
+    # 3. 全局默认
+    if self.global_config:
+        return self.global_config
+
+    # 4. 都没匹配 → 不量化
+    return None
+```
+
+### 11.5 从零写一个自定义 Quantizer
+
+把上面的知识串起来——手写一个指定"只量化 Conv2d 的 weight (4-bit)、不量化激活"的 Quantizer：
+
+```python
+from torch.ao.quantization.quantizer import (
+    Quantizer, QuantizationSpec, SharedQuantizationSpec,
+    DerivedQuantizationSpec, FixedQParamsQuantizationSpec,
 )
+from torch.ao.quantization.observer import PerChannelMinMaxObserver
+
+class WeightOnlyQuantizer(Quantizer):
+    """自定义 Quantizer: 只量化 Conv2d 的 weight 到 4-bit, 激活不量化"""
+
+    def __init__(self, n_bits=4):
+        super().__init__()
+        self.n_bits = n_bits
+
+    def transform_for_annotation(self, model):
+        # 不做预处理
+        return model
+
+    def annotate(self, model):
+        for node in model.graph.nodes:
+            if node.op != 'call_function':
+                continue
+
+            # ★ 只标注 Conv2d 的 weight
+            if node.target == torch.ops.aten.conv2d.default:
+                # input[0] (激活): 不标注 → 不量化
+                # input[1] (weight): per-channel 量化
+                qmax = 2 ** (self.n_bits - 1) - 1
+                self.annotations[(node, node.args[1])] = QuantizationSpec(
+                    dtype=torch.int8,
+                    quant_min=-qmax,
+                    quant_max=qmax,
+                    qscheme=torch.per_channel_symmetric,
+                    observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(
+                        dtype=torch.qint8,
+                        qscheme=torch.per_channel_symmetric,
+                        quant_min=-qmax,
+                        quant_max=qmax,
+                    ),
+                )
+                # input[2] (bias): 推导 (从 weight scale 推导 bias scale)
+                self.annotations[(node, node.args[2])] = DerivedQuantizationSpec(
+                    derived_from=[(node, node.args[1])],
+                    derive_qparams_fn=lambda obs: (
+                        obs[0].calculate_qparams()[0],
+                        torch.tensor([0], dtype=torch.int32)
+                    ),
+                    dtype=torch.int32,
+                    quant_min=-(2**31),
+                    quant_max=2**31-1,
+                    qscheme=torch.per_tensor_symmetric,
+                )
+
+            # Add / ReLU / Linear 等 → 全部不标注 → 保持 FP32
+            # (未标注的 op = conv2d 的 input[0] = 永远不量化)
+
+    def validate(self, model):
+        # 验证: 所有 call_function 节点要么被标注, 要么不是我们关心的 op
+        for node in model.graph.nodes:
+            if node.op == 'call_function':
+                has_annotation = any(
+                    (node, arg) in self.annotations
+                    for arg in node.args if isinstance(arg, torch.fx.Node)
+                )
+                # WeightOnly 策略: 未标注 = 故意保持 FP32, 不报错
+                pass
+
+# 使用:
+quantizer = WeightOnlyQuantizer(n_bits=4)
+prepared = prepare_qat_pt2e(gm, quantizer)
+# prepare 后的图: 只有 weight 路径上有 FQ 节点, 激活路径保持 FP32
+```
+
+### 11.6 QConfigMapping vs Quantizer — 什么时候用哪个
+
+```
+QConfigMapping (FX Mode):
+  - 适合: 标准 CNN/ResNet 模型的量化
+  - 定位: 给标准 PyTorch 模型 (nn.Module 树结构) 做量化
+  - 配置粒度: 按模块名 / 模块类型 / 正则
+  - 缺点: 不支持自定义 op 的量化逻辑, 后端适配隐藏在 Observer 选择中
+
+Quantizer (PT2E): ★ 推荐
+  - 适合: 任何模型 (包括自定义 op、动态控制流)
+  - 定位: 给 ATen 图做量化标注
+  - 配置粒度: 按 ATen op 类型 / 图节点关系
+  - 优点: 完全可定制 — 想量化什么、怎么量化, 完全由你控制
+  - 换后端 = 换 Quantizer: XNNPACK vs TensorRT vs 自定义
+
+如果你是"用标准模型做标准量化" → QConfigMapping 够用
+如果你是"自定义量化策略、非标准 op、特定后端的精度优化" → 必须用 Quantizer
 ```
 
 ---
