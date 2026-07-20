@@ -484,6 +484,74 @@ def quant_asym(x, n=8):
 # mse_sym_wt ≈ mse_asym_wt        →  对称对权重够好甚至更好
 ```
 
+### 3.4 权重量化 vs 激活量化：两条并行的线
+
+前面 §3.1-§3.3 讲了对称/非对称的选择逻辑。但有一个更根本的问题没展开：**一个量化模型里，权重和激活都要量化，而且策略完全不同。**
+
+```
+一个 Conv2d 的量化推理:
+
+  输入激活 (FP32)              权重 (FP32)
+       │                          │
+       ├─ FakeQuantize ──→ INT8   ├─ FakeQuantize ──→ INT8
+       │                          │
+       └──────→ INT8 矩阵乘法 ←──────┘
+                     │
+                     ↓
+               输出激活 (INT8 或 FP32)
+```
+
+**权重和激活是两条完全独立的量化线**——各用各的 scale、各用各的 zero_point、各用各的粒度。它们唯一的共同点是：量化公式都是 `q = round(r/S + Z)`。
+
+**为什么策略不同？根因在一个差异：**
+
+| | 权重 (Weight) | 激活 (Activation) |
+|---|---|---|
+| **什么时候知道值？** | 训练完就知道了 | 推理时才知道，取决于输入 |
+| **可以离线分析吗？** | ✓ 可以慢慢校准 | ✗ 需要在线观察或提前校准 |
+| **分布形态** | 以 0 为中心，近似正态 | ReLU 后全 ≥0，偏态分布 |
+| **对称 vs 非对称** | **对称**（Z=0） | **非对称**（利用全部 256 等级） |
+| **默认粒度** | **Per-Channel** | **Per-Tensor**（CV）/ **Per-Token**（LLM） |
+| **为什么选这个粒度** | 通道间范围差 50-300 倍，必须分开 | 激活的 batch 维通常范围相近（CV），或 token 间差异大（LLM） |
+| **在 PyTorch 里的名字** | `weight_fake_quant` | `activation_post_process` |
+
+**用 §3.2 的数据直观对比：**
+
+```python
+# 同一个 Conv2d 层，权重和激活的量化参数完全不同
+
+# 权重 (以 0 为中心的对称分布)
+W = torch.randn(64, 3, 3, 3) * 0.3
+S_w = W.abs().max() / 127          # 对称: Z=0, Per-Tensor 用全局 max
+# → S_w ≈ 0.007, Z_w = 0
+
+# 激活 (ReLU 输出, 全 ≥0)
+X = torch.relu(torch.randn(1, 64, 32, 32))
+S_x = (X.max() - X.min()) / 255    # 非对称: Z≠0, 全正范围
+Z_x = torch.round(-X.min() / S_x)
+# → S_x ≈ 0.012, Z_x = 0 (min=0时Z=0——非对称的特殊情况)
+
+# 两条线各自独立量化
+q_w = torch.round(W / S_w).clamp(-128, 127)          # 权重侧
+q_x = torch.round(X / S_x + Z_x).clamp(0, 255)       # 激活侧
+#                                 ↑ 不同的 clamp 范围！
+```
+
+**这就是为什么 Stage 1 里每个 Conv 都有 2 个 FakeQuantize**——一个挂在权重上（Per-Channel 对称），一个挂在激活输入上（Per-Tensor 非对称）。它们是两个独立的 Observer → FakeQuantize 管线，各自校准、各自冻结、各自量化。
+
+```
+Stage 1 的 PT2E 管线里你会看到:
+
+  Conv2d
+  ├── weight_fake_quant:   对称 Per-Channel INT8   Observer → FQ
+  └── activation_fake_quant: 非对称 Per-Tensor INT8  Observer → FQ
+
+  这两个 FQ 互不干扰——scale 不同、zero_point 不同、粒度不同、校准数据不同。
+  唯一共享的是: 都在 INT8 域做矩阵乘法。
+```
+
+把这个区别刻进脑子——后面每个 Stage 里提到"量化策略"，你第一反应应该是**"说的是权重还是激活？"**。
+
 ---
 
 ## 4. 量化粒度：一个 scale 管多大范围
