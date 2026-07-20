@@ -17,9 +17,9 @@
 
 ## 这是什么？ / What is this?
 
-一套面向 **模型量化 (Model Quantization)** 的自学笔记，适合有深度学习基础、想系统入门模型压缩与优化的同学。这里不讲"调包即用"——每一行代码都有对应的数学推导和框架源码级拆解，目标是让你**真正看懂工具链在做什么**。
+一套面向 **模型量化 (Model Quantization)** 的自学笔记，从量化基础理论开始（浮点数怎么存、量化公式怎么推、误差从哪来），一路深入到 PyTorch 框架源码和 LLM 量化部署。适合有深度学习基础、想系统入门模型压缩与优化的同学。这里不讲"调包即用"——每一行代码都有对应的数学推导和框架源码级拆解，目标是让你**真正看懂工具链在做什么**。
 
-*A self-study notebook on model quantization — for those with DL foundations who want to master model compression & optimization. No "call the API and move on" — every line of code is backed by math and framework source-level breakdown. The goal is to understand what the toolchain actually does.*
+*A self-study notebook on model quantization — starting from first principles (IEEE 754, the quantization formula, error analysis) all the way to PyTorch source internals and LLM quantization deployment. For those with DL foundations who want to master model compression & optimization. No "call the API and move on" — every line of code is backed by math and framework source-level breakdown. The goal is to understand what the toolchain actually does.*
 
 我的背景：有深度学习基础，训练过模型、做过部署，但在模型压缩这块一直停留在"知道 INT8 比 FP32 快"的层面。这个仓库就是我把它从头啃透的过程——目标是看到一个量化模型的推理链路时，能说清楚从浮点数到整数、再到硬件指令的每一步在做什么。
 
