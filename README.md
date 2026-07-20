@@ -21,9 +21,9 @@
 
 *A self-study notebook on model quantization — for those with DL foundations who want to master model compression & optimization. No "call the API and move on" — every line of code is backed by math and framework source-level breakdown. The goal is to understand what the toolchain actually does.*
 
-我自己的背景：对深度学习基础懂个六七成（Sigmoid 查表、ONNX 图优化、端侧部署），但知识比较散。这个仓库是我**从 YOLO 练手到 LLaMA 量化**的完整学习记录。
+我的背景：有深度学习基础，训练过模型、做过部署，但在模型压缩这块一直停留在"知道 INT8 比 FP32 快"的层面。这个仓库就是我把它从头啃透的过程——目标是看到一个量化模型的推理链路时，能说清楚从浮点数到整数、再到硬件指令的每一步在做什么。
 
-*My background: ~70% solid on DL fundamentals (sigmoid LUT, ONNX graph optimization, edge deployment), but knowledge was fragmented. This repo is my complete learning trail — from YOLO practice to LLaMA quantization.*
+*My background: solid DL foundations — trained models, deployed to production. But model compression stayed at the "INT8 is faster than FP32" level. This repo is me tearing it down to first principles. The goal: trace a quantized model's inference path and explain every step — from floating-point bits to integer arithmetic to hardware instructions.*
 
 <br>
 
