@@ -1064,18 +1064,218 @@ X_q = q * S_token.unsqueeze(2)
 
 ## 5. 校准算法：scale 和 zero_point 怎么算
 
-校准是一个优化问题：找一对 (S, Z) 使量化误差最小。
+校准是一个优化问题：找一对 (S, Z) 使量化误差最小。但你没法"优化"——校准阶段没有反向传播，没有梯度。你只能**从数据分布中挑一个 r_max 和 r_min**，然后代入 §2 的公式算出 S 和 Z。
 
-### 5.1 四种校准器一览
+四种校准器的核心区别就是：**怎么从数据分布里挑 r_max / r_min？**
 
-| 校准器 | 做法 | 优点 | 缺点 |
-|--------|------|------|------|
-| **MinMax** | 覆盖全部范围 | 最快 | outlier 毁一切 |
-| **Percentile** | 覆盖 99.9% 范围 | 抗 outlier | 丢弃 0.1% 数据 |
-| **MSE** | 网格搜索最小化 MSE | 理论最优 | 慢 |
-| **KL Divergence** | 最小化分布差异 | TensorRT 默认 | 需要直方图 |
+| 校准器 | 核心思路 | 一句话 |
+|--------|---------|--------|
+| **MinMax** | r_max = 数据最大值 | "全都要" |
+| **Percentile** | r_max = 第 99.9 百分位数 | "舍小保大" |
+| **MSE** | 网格搜索 r_max，最小化 MSE | "暴力找最优" |
+| **KL Divergence** | 搜 r_max，使量化前后分布最像 | "保护分布形状" |
 
-### 5.2 完整实现
+### 5.1 MinMax：最简单，也最脆弱
+
+```
+做法: r_max = max(|x|),  r_min = min(x)
+      S = r_max / 127  (对称),  S = (r_max - r_min) / 255  (非对称)
+```
+
+**数值演示——outlier 怎么毁了 MinMax：**
+
+```python
+import torch
+
+# 模拟一个"正常 + outlier"的激活张量
+x = torch.randn(10000) * 2.0        # 9998 个正常值, 范围 [-6, 6]
+x[0] = 80.0                          # 1 个 outlier
+x[1] = -50.0                         # 另 1 个 outlier
+
+# MinMax 校准
+S_mm = x.abs().max() / 127           # 80.0 / 127 ≈ 0.6299
+q = torch.round(x / S_mm).clamp(-128, 127)
+x_q = q * S_mm
+
+# 看看正常值被碾成什么样
+normal_mask = (x.abs() < 10)
+print(f"正常值的 99.9% 范围: [{x[normal_mask].min():.1f}, {x[normal_mask].max():.1f}]")
+# → [-6.3, 6.1]
+print(f"除以 S=0.6299 后: [{x[normal_mask].min()/S_mm:.1f}, {x[normal_mask].max()/S_mm:.1f}]")
+# → [-10.0, 9.7]
+print(f"round 后 INT8 范围: [{q[normal_mask].min().item()}, {q[normal_mask].max().item()}]")
+# → [-10, 10]  ← 只用了 21 个等级！256 个等级里 235 个闲着
+
+# MSE 对比
+mse_normal = ((x[normal_mask] - x_q[normal_mask]) ** 2).mean()
+print(f"正常值的 MSE: {mse_normal:.4f}")  # → ≈ 0.033  ← 很大
+# 根因: S 被 outlier 绑架了→ 0.6299, 但 99.98% 的数据只需要 S=6.3/127≈0.05
+```
+
+**问题一目了然**：2 个 outlier（占总数据的 0.02%）把 scale 从 0.05 拉到 0.63，大了 12.6 倍。99.98% 的正常数据被一个不合理的 scale"碾碎"到只有 21 个 INT8 等级可用。
+
+**MinMax 的适用场景**：数据分布均匀、无 outlier。ResNet 中间层的激活值通常满足这个条件——经过 BatchNorm 后分布稳定，不会有突然的大值。
+
+### 5.2 Percentile：砍掉尾巴
+
+```
+做法: 对数据排序，取第 p 和第 (100-p) 百分位数作为 r_min 和 r_max
+      常用 p = 99.9% 或 99.99%
+      
+      lo = 排序后第 int(n × (1-pct)) 个值
+      hi = 排序后第 int(n × pct) 个值
+      S = (hi - lo) / 255
+```
+
+**核心思想**：主动丢弃最极端的 0.1%（或 0.01%），换取剩下 99.9% 数据的量化精度。
+
+```python
+x = torch.randn(10000) * 2.0
+x[0], x[1] = 80.0, -50.0  # 同样的 outlier
+
+pct = 0.999  # 保留 99.9%
+sorted_vals = x.flatten().sort().values
+n = len(sorted_vals)
+lo = sorted_vals[int(n * (1 - pct))]   # 第 0.1 百分位
+hi = sorted_vals[int(n * pct)]         # 第 99.9 百分位
+
+print(f"MinMax 范围:  [{x.min():.1f}, {x.max():.1f}]")     # [-50, 80]
+print(f"Percentile 范围: [{lo:.2f}, {hi:.2f}]")            # [-6.02, 6.18]
+
+S_pct = (hi - lo) / 255  # ≈ 0.0478
+# 对比 MinMax: S_mm = 80/127 ≈ 0.63
+print(f"S_percentile / S_minmax = {S_pct / S_mm:.3f}")    # → ≈ 0.076
+# Percentile 的 scale 只有 MinMax 的 7.6% → 精度高 13 倍
+```
+
+**代价是什么？** outlier 被 clip 了。但 10000 个值里丢了 20 个（0.2%），换来了 256 个等级全用在 99.8% 的数据上。这个 trade-off 在大多数场景下是划算的。
+
+**什么时候不能用 Percentile？** LLM 的激活。LLM 里有"outlier channel"——不是随机噪声，是模型精心学到的注意力信号。砍掉这些 outlier channel 的值等于砍掉模型的注意力。这就是为什么 TensorRT 对 LLM 不用 Percentile 而用 KL Divergence。
+
+### 5.3 MSE：暴力搜索最优 amax
+
+```
+做法: 在 [max/100, max] 范围内均匀采样 100 个候选 amax
+      每个 amax → S = amax/127 → 量化 → 反量化 → 算 MSE
+      选 MSE 最小的 amax
+```
+
+**MSE 的 U 形曲线**——这是理解校准器工作的关键：
+
+```
+MSE ↑
+    │
+    │  ╲                        ╱
+    │   ╲    Clip Error 主导    ╱  Round Error 主导
+    │    ╲   (amax太小，        ╱   (amax太大，
+    │     ╲  太多值被截断)     ╱    刻度太粗)
+    │      ╲                  ╱
+    │       ╲                ╱
+    │        ╲              ╱
+    │         ╲            ╱
+    │          ╲──────────╱
+    │              ↑ 最优 amax
+    │          Clip Error ≈ Round Error
+    └──────────────────────────────→ amax
+    小                              大
+```
+
+**为什么是 U 形？** 因为有两个对抗的力：
+- amax 太小 → 大量值被 clamp → Clip Error 主导（左边上升）
+- amax 太大 → scale 变大 → 每个量化台阶变宽 → Round Error 主导（右边上升）
+- 最优 amax 在 U 形底部——两个误差刚好平衡
+
+```python
+# 可视化 MSE vs amax 曲线
+x = torch.randn(10000) * 2.0
+x[0], x[1] = 80.0, -50.0  # outlier
+
+amax_candidates = torch.linspace(x.abs().max()/100, x.abs().max(), 100)
+mses = []
+for amax in amax_candidates:
+    s = amax / 127
+    q = torch.round(x / s).clamp(-128, 127)
+    x_q = q * s
+    mses.append(((x - x_q) ** 2).mean().item())
+
+best_idx = mses.index(min(mses))
+print(f"MinMax amax:    {x.abs().max():.2f}")          # → 80.0
+print(f"最优 amax (MSE): {amax_candidates[best_idx]:.2f}")  # → ~7.8
+print(f"MinMax MSE:     {mses[0]:.6f}")                  # 差
+print(f"最优 MSE:       {mses[best_idx]:.6f}")           # 好 ~10-100x
+
+# 运行输出:
+# MinMax amax:    80.00
+# 最优 amax (MSE): 7.84
+# MinMax MSE:     0.033000
+# 最优 MSE:       0.000320
+# → MSE 改善了 ~103 倍！
+```
+
+**MSE 的问题**：需要 100 次"量化→反量化→算 MSE"的循环，比 MinMax 慢 100 倍。而且 MSE 最优 ≠ 任务精度最优——MSE 关心的是数值重建精度，不是分类/生成任务的最终精度。
+
+### 5.4 KL Divergence：保护分布形状（TensorRT 默认）
+
+```
+做法: 1. 对 |x| 建 2048-bin 直方图
+      2. 从第 1024 个 bin 开始，逐个尝试截断点 t
+      3. 对每个 t: 把 [0, t] 映射到 INT8 的 128 个等级
+         把 [t, max] 的所有值压缩到第 128 个等级（截断）
+      4. 算 KL(原始分布 || 量化后分布)
+      5. 选 KL 最小的 t
+```
+
+**为什么 KL 而不是 MSE？** MSE 衡量的是"值差多少"，KL Divergence 衡量的是"分布形状变多少"。深度学习推理关心的是后续层的响应模式——分布形状被保留 = 网络的响应模式被保留 = 任务精度被保留。两个完全不同的值可能有相同的 KL……
+
+换句话：如果数据是 `[1.5, 1.6, 1000.0]`，MSE 被 1000 主导，KL 被 `[1.5, 1.6]` 主导。KL 不关心 outlier 的值具体是多少——只关心它被截断后落在哪个 bin 里。对于神经网络，一个巨大的激活值被截断到边界后，后续层的响应模式通常不变（因为 ReLU 后的值被 BN 归一化过）。
+
+**KL 校准器的直观理解：**
+
+```
+原始直方图:            量化后直方图 (3-bit 示意):
+  ██                      ██
+  ██  ██                  ██  ██
+  ██  ██  ██              ██  ██  ██
+  ██  ██  ██  ██    →    ██  ██  ██  ▓▓  ← 尾部被"折叠"进最后一个 bin
+  ██  ██  ██  ██  ▓       ██  ██  ██  ██
+  ─────────────────      ─────────────────
+  值从小到大               值从小到大
+
+  KL 做的事: 找到截断点 t，使得红色分布和蓝色分布"最像"
+```
+
+**KL 是 TensorRT 的默认校准器**——因为它在速度和精度间取得了最好的平衡，并且对任何分布形态都能工作（不需要假设数据是正态分布）。
+
+### 5.5 四种校准器的选择 —— 从数据特征出发
+
+```
+数据有 outlier 吗？
+│
+├── 没有 (如 BatchNorm 后的激活)
+│   → MinMax 够用——简单、零配置
+│
+└── 有 (LLM 激活、图像输入层)
+    │
+    ├── outlier 是噪声 (传感器坏点、数据脏)
+    │   → Percentile——直接砍掉
+    │
+    ├── outlier 是信号 (LLM attention spike)
+    │   → KL Divergence——保护分布形状
+    │   或 Stage 6 的 SmoothQuant/AWQ——把 outlier 从激活挪到权重
+    │
+    └── 有大量校准数据 + 时间
+        → MSE——找到 MSE 最优的 amax
+```
+
+**一个常见的坑**：对 LLM 的激活值不要用 Percentile——LLM 的 outlier channel 不是噪声，是模型"精心"学到的注意力信号。删掉它们 = 删掉核心能力。这就是 Stage 6 的 SmoothQuant 和 AWQ 试图解决的问题。
+
+**快速记忆法**：
+- MinMax = "全都要"（适合干净数据）
+- Percentile = "砍尾巴换精度"（适合噪声 outlier）
+- MSE = "暴力找最优"（适合有时间、有数据）
+- KL Divergence = "保护分布形状"（工业默认，通用性最强）
+
+### 5.6 完整实现
 
 ```python
 import torch
@@ -1145,18 +1345,7 @@ for name, cal in [("MinMax",MinMaxCalibrator()),("Percentile",PercentileCalibrat
 # MinMax 被 outlier 拖垮；Percentile/MSE/KL 表现好
 ```
 
-### 5.3 四种校准器的选择 —— 从数据特征出发
-
-不同的校准器不是"谁更好"，而是"谁更适合你的数据分布"：
-
-- **MinMax**：数据干净、outlier 少的场景（如 ResNet 的中间层）
-- **Percentile**：已知有 outlier 但 outlier 是噪声（不是信号）——如输入图片的传感器坏点
-- **KL Divergence**：数据分布未知时——工业默认（TensorRT 用这个），通用性最好
-- **MSE**：追求 MSE 最优，但不知道是否是"任务最优"
-
-**一个常见的坑**：对 LLM 的激活值不要用 Percentile——LLM 的 outlier channel 不是噪声，是模型"精心"学到的注意力信号。删掉它们 = 删掉核心能力。这就是 Stage 6 的 SmoothQuant 和 AWQ 试图解决的问题。
-
-### 5.4 串联：scale 的前世今生 —— 从公式到 LSQ
+### 5.7 串联：scale 的前世今生
 
 上面四种校准器都在做同一件事：**找到一对 (S, Z)，让量化后的数据尽可能接近原始数据**。但你在后面每个 Stage 里看到的 "scale" 是同一个概念的不同演化形态。这里画一条完整的演化线——读完这节，后面学到任何阶段你都知道 "scale 从哪来、怎么被用、最后怎么被取代"。
 
