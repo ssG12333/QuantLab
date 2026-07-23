@@ -630,6 +630,26 @@ Per-Group(128): 4096 × 32 = 131,072 个 scale，每个管 128 个值
 
 有了这张"结构地图"，下面每个小节的数值实验就不会搞不清"现在 scale 沿哪一维在算"。
 
+**⭐ 一个概念提前认领：`axis`**
+
+后面在 Stage 1 源码和 ONNX 导出里，你会反复看到 `axis` 这个参数——它就是上面这张图里"切分的那一维"：
+
+```
+W.shape = [64, 3, 3, 3]  →  axis=0 表示"沿第 0 维，每个切片一个 scale"
+
+axis=0:  64 个 scale，每个管 [:, 3, 3, 3]  → Per-Channel (沿 out_channel)
+axis=1:  3 个 scale，  每个管 [64, :, 3, 3]  → 沿 in_channel（没人这么做，只是举例）
+axis=None: 1 个 scale，管整个 tensor          → Per-Tensor
+
+torch.ops.quantized_decomposed.quantize_per_channel(
+    input, scales, zero_points, axis=0,  ...  ← 就是这个 axis
+)
+
+ONNX QuantizeLinear 也有 axis 属性，含义一样——scales 沿 input 的哪一维广播。
+```
+
+**一句话**：axis = scale 沿 tensor 的哪一维在变。axis=0 → 64 个 scale 沿 out_ch 维，axis=None → 1 个 scale 管全部。这个概念在整个量化的代码、ONNX 图、推理引擎里无处不在——现在就注入。
+
 ### 4.1 Per-Tensor 的灾难：一个大 scale "碾碎"小通道
 
 构造一个极端但真实的例子：Conv2d weight `[64, 3, 3, 3]`，64 个输出通道，但故意让不同通道的数值范围差 100 倍。
