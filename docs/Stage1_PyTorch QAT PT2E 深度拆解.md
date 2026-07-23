@@ -1978,6 +1978,286 @@ Quantizer (PT2E): ★ 推荐
 
 ---
 
+### 11.7 Q/DQ 插入规则全表：哪些算子要 Q/DQ，哪些不要
+
+> 这是从 [Stage 0 §7.8 Q/DQ 概念框架](../Stage0_量化基础与硬件基石.md) 展开的**完整工程速查表**。Stage 0 给了你核心判据——"值变 → Q/DQ，形变/搬运 → 不插"——这里把那个判据展开到每一种 ATen op、给出 ASCII 数据流图、常见误判、以及对应的 QSpec 代码映射。
+
+---
+
+#### 11.7.1 五类重新梳理（含数据流图）
+
+**类别 A：INT8 kernel 算子 → 全 Q/DQ**
+
+这是量化推理的"主角"——硬件有专门的 INT8 指令。
+
+```
+   input (FP32)
+      │
+      ▼
+  ┌──────────────┐
+  │ Quantize      │  ← Q_input:  r → q_a ∈ [0,255] (per-tensor, 非对称)
+  └──────────────┘
+      │ INT8                         ┌─────────────────────┐
+      ▼                              │ weight (FP32)       │
+  ┌──────────────┐                   │   ↓                 │
+  │ Conv / Linear │ ← INT8×INT8     │ Quantize            │ ← Q_weight: per-channel, 对称
+  │ ↓ INT32 acc   │   乘加            │   ↓ INT8            │
+  │ ↓ requantize  │   INT32→INT8     │                     │
+  └──────────────┘                   └─────────────────────┘
+      │ INT8
+      ▼
+  ┌──────────────┐
+  │ Dequantize    │  ← DQ:  q_out → r_out (FP32)
+  └──────────────┘
+      │ FP32 ← 下一层自己再决定 Q 不 Q
+```
+
+| 算子 | 权重 Q | 激活输入 Q | 激活输出 DQ | weight Q 粒度 |
+|------|:--:|:--:|:--:|------|
+| Conv1d / Conv2d / Conv3d | ✅ | ✅ | ✅ | per-channel (axis=0) |
+| ConvTranspose1d/2d/3d | ✅ | ✅ | ✅ | per-channel (axis=0) |
+| Linear (FC) | ✅ | ✅ | ✅ | per-channel (axis=0) |
+| LSTM / GRU (INT8 kernel) | ✅ | ✅ | ✅ | per-channel |
+
+**在 PT2E 里怎么实现**：weight → `QuantizationSpec(dtype=torch.int8, ...)`；activation input → `QuantizationSpec(dtype=torch.int8, ...)`；activation output → `QuantizationSpec(dtype=torch.int8, ...)`（这三条 Spec 各自独立，共享输出端也可以选无 Spec）。
+
+---
+
+**类别 B：多输入算子 → 共享 Q + DQ**
+
+Add、Concat、Mul 有多个输入。如果 branch1 的 S₁=0.02、branch2 的 S₂=0.05，同一个实数对应不同整数——直接运算无意义。
+
+```
+  关键问题:
+    branch1: q₁=100, S₁=0.02 → 实数值 2.0
+    branch2: q₂=40,  S₂=0.05 → 实数值 2.0
+    → 整数 100 ≠ 40，ADD(100,40) = 140 无意义
+```
+
+**解决方案**：两路先统一到同一个 scale。
+
+```
+  branch1 (INT8, S₁=0.02)
+      │
+      ▼
+  ┌──────────────┐
+  │ Dequantize    │  ← 回到 FP32
+  └──────────────┘
+      │ FP32
+      ▼
+  ┌──────────────┐
+  │ Quantize      │  ← 用共享 S_shared 重新量化
+  └──────────────┘               branch2 同样走 DQ → Q(shared)
+      │ INT8 (S_shared)           │
+      ▼                          ▼
+  ┌──────────────┐
+  │ Add / Concat  │ ← 两个输入 scale 相同 → 整数运算有意义
+  └──────────────┘
+      │ INT8
+      ▼
+  ┌──────────────┐
+  │ Dequantize    │
+  └──────────────┘
+      │ FP32
+```
+
+| 算子 | 输入侧 | 输出侧 | 特殊要求 |
+|------|:--:|:--:|------|
+| Add | 共享 Q | DQ | 两输入 scale 必须统一 |
+| Sub | 共享 Q | DQ | 同上 |
+| Mul | 共享 Q | DQ | INT8 乘法有指令，但 scale 必须统一 |
+| Concat | 共享 Q | DQ | 拼接 dim 上每段 scale 要相同 |
+| Cat | 共享 Q | DQ | 同 Concat |
+
+**在 PT2E 里怎么实现**：输入侧 → `SharedQuantizationSpec(edge_or_node)`，所有输入分支指向**同一个** FQ/ Observer 实例。
+
+---
+
+**类别 C：没有 INT8 kernel → FP32 fallback → DQ + Q**
+
+会改变值，但硬件没有对应 INT8 指令。
+
+```
+  input (INT8)
+      │
+      ▼
+  ┌──────────────┐
+  │ Dequantize    │  ← 先 DQ: q → r (FP32)
+  └──────────────┘
+      │ FP32
+      ▼
+  ┌──────────────┐
+  │ Sigmoid / Tanh│  ← FP32 计算
+  │ / Softmax     │
+  │ / LayerNorm   │
+  │ / GELU(无LUT) │
+  └──────────────┘
+      │ FP32
+      ▼
+  ┌──────────────┐
+  │ Quantize      │  ← 再 Q: r → q (INT8)
+  └──────────────┘
+      │ INT8
+```
+
+| 算子 | 输入侧 | 输出侧 | 备注 |
+|------|:--:|:--:|------|
+| Sigmoid | DQ | Q | 有 LUT 则跳到类别 D |
+| Tanh | DQ | Q | 有 LUT 则跳到类别 D |
+| GELU | DQ | Q | 有 LUT 则跳到类别 D |
+| SiLU / Swish | DQ | Q | 同上 |
+| Softmax | DQ | Q / 保持 FP32 | LUT 需要 64KB（256×256），太大，通常 FP32 fallback |
+| LayerNorm | DQ | Q | 需要算 mean/std，没有 INT8 kernel |
+| BatchNorm | — | — | fuse 阶段已吸收进 Conv，推理图中不存在 |
+
+---
+
+**类别 D：纯搬运 → 不插任何 Q/DQ**
+
+不改变元素的值——只改形状、顺序、或选子集。
+
+```
+  INT8 [64, 27]  --reshape-->  INT8 [64, 3, 3, 3]
+  ↑ 1728 个 INT8             ↑ 还是那 1728 个 INT8
+  值不变 → 不需要 DQ→FP32→reshape→Q→INT8
+```
+
+| 算子 | Q/DQ？ | 原因 |
+|------|:--:|------|
+| Reshape / View / Flatten | ❌ | 只改 shape/stride |
+| Transpose / Permute | ❌ | 只改 stride |
+| Squeeze / Unsqueeze | ❌ | 增删维度 |
+| Slice / Split / Chunk | ❌ | 切子集 |
+| Pad / ZeroPad | ❌ | 填 Z 值（INT8 的零） |
+| **MaxPool2d / AvgPool2d** | ❌ | Max 比大小在 INT8 下等价；Avg 在 INT32 累加取整 |
+| Dropout | ❌ | 推理时 Identity |
+| Identity | ❌ | 透传 |
+| **ReLU** | ❌ | LUT 查表：`lut[q] = max(q, Z)`，不需要 Q/DQ |
+
+**Pool 不需要 Q/DQ 的证明**：
+
+```
+MaxPool (2×2, stride=2) 消费 INT8:
+  INT8 [1,64,56,56]
+      │  对每个 2×2 窗口取 max INT8
+      ▼
+  INT8 [1,64,28,28]
+  
+  INT8 比大小 = FP32 比大小（同一个 scale 下是单调映射）:
+    int8: max(10,25,8,42) = 42
+    fp32: max(0.2,0.5,0.16,0.84) = 0.84 → 量化回去 = 42 ✓
+```
+
+---
+
+**类别 E：特殊情形**
+
+| 组件 | Q/DQ | 原因 |
+|------|:--:|------|
+| Bias | Derived | `S_bias = S_w × S_a`，不插独立 Q。→ `DerivedQuantizationSpec` |
+| BatchNorm | ❌ | fuse 阶段吸收进 Conv，不存在 |
+| 模型输入 | Q（首层之前） | 输入 FP32 → 第一层之前必须 Q |
+| 模型输出 | DQ（尾层之后） | Logits/BBox 需要 FP32 |
+| Residual Add | 共享 Q（类别 B） | ResNet skip connection |
+| Multi-Head Attn | 各 MatMul 独立 Q/DQ | QKV 各走各的 Linear，softmax 走类别 C |
+
+---
+
+#### 11.7.2 完整速查表（30 种算子，按字母序）
+
+```
+算子              权重 Q    输入 Q    输出 DQ   对应 QSpec 类型
+──────────────────────────────────────────────────────────────────
+Add                       共享 Q       ✅       SharedQuantizationSpec
+AvgPool2d                  ❌         ❌       (不标注)
+BatchNorm                  —          —       (图中不存在)
+Bias              Derived  —          —       DerivedQuantizationSpec
+Cat                        共享 Q       ✅       SharedQuantizationSpec
+Chunk                       ❌         ❌       (不标注)
+Conv1d/2d/3d        ✅      ✅         ✅       weight+input→QSpec, output→QSpec
+ConvTranspose       ✅      ✅         ✅       weight+input→QSpec, output→QSpec
+Concat                      共享 Q       ✅       SharedQuantizationSpec
+Dropout                      ❌         ❌       (不标注)
+Flatten                      ❌         ❌       (不标注)
+GELU                        DQ          Q       input→DQ(不标注), output→QSpec
+Identity                     ❌         ❌       (不标注)
+LayerNorm                   DQ          Q       input→DQ(不标注), output→QSpec
+Linear               ✅      ✅         ✅       weight+input→QSpec, output→QSpec
+LSTM                 ✅      ✅         ✅       weight+input→QSpec, output→QSpec
+MaxPool2d                    ❌         ❌       (不标注)
+Mul                        共享 Q       ✅       SharedQuantizationSpec
+Pad                          ❌         ❌       (不标注)
+Permute                      ❌         ❌       (不标注)
+ReLU                         ❌         ❌       (不标注 — LUT 消费 INT8)
+Reshape                      ❌         ❌       (不标注)
+Sigmoid                     DQ          Q       input→DQ(不标注), output→QSpec
+SiLU/Swish                  DQ          Q       input→DQ(不标注), output→QSpec
+Slice                        ❌         ❌       (不标注)
+Softmax                     DQ          Q/FP32  input→DQ(不标注), output→QSpec
+Split                        ❌         ❌       (不标注)
+Squeeze                      ❌         ❌       (不标注)
+Sub                         共享 Q       ✅       SharedQuantizationSpec
+Tanh                        DQ          Q       input→DQ(不标注), output→QSpec
+Transpose                    ❌         ❌       (不标注)
+Unsqueeze                    ❌         ❌       (不标注)
+View                         ❌         ❌       (不标注)
+```
+
+#### 11.7.3 常见误判
+
+```
+误判 1: "Reshape 前要 DQ，reshape 完再 Q"
+  错。INT8 值不变，加了 DQ→reshape→Q 是三重浪费。
+
+误判 2: "MaxPool 对 INT8 输入需要 DQ"
+  错。Max 比大小在 INT8 和 FP32 下结果一致。
+
+误判 3: "所有 Activation 函数都要 DQ→FP32→Q"
+  错。ReLU 有 LUT（等价于 clamp(q, Z, 255)），Sigmoid/Tanh/GELU 也有 LUT。
+  只有 Softmax 和 LayerNorm 绕不开 FP32 fallback。
+
+误判 4: "Concat 本身要插 Q"
+  错。Q/DQ 插在输入分支上（共享 scale），Concat 本身只是拼。
+
+误判 5: "Pool 后面的 Conv 不需要输入 Q"
+  错。Pool 输出 INT8 带上一层的 output scale。下一个 Conv 的 input Q
+  是从校准数据重新估算的——和 Pool 的那个 scale 不同。
+```
+
+#### 11.7.4 从速查表到 Quantizer 代码
+
+上面表的最后一列"对应 QSpec 类型"可以直接映射到 PT2E Quantizer：
+
+```
+速查表 "✅ Q"         →  QuantizationSpec(dtype=torch.int8, ...)
+速查表 "共享 Q"       →  SharedQuantizationSpec(edge_or_node)
+速查表 "Derived"     →  DerivedQuantizationSpec(derived_from)
+速查表 "DQ"           →  输入侧不标注 QSpec（靠前一层输出 DQ 自然回到 FP32）
+速查表 "❌" / "(不标注)" →  annotate() 里对该 op/edge 不调用 set_*
+```
+
+**"不标注" ≠ "标注传递"**——一个常见混淆点：
+
+```
+"不标注" (Reshape / Transpose / Pool / etc.):
+  annotate(node):  ← 什么都不做，直接跳过
+  效果: 该 op 前后没有 Q/DQ 节点
+  数据在 FP32 域流动: ...DQ → Reshape(FP32) → Q...
+                          ↑ 前一个 op 的 DQ    ↑ 后一个 op 的 Q
+  Reshape 自己什么都不插，透明躺在 FP32 区域里
+
+"共享 Q" (Add / Concat / Mul):
+  annotate(node):  edge_a.set_(SharedQuantizationSpec(anchor=edge_a))
+                   edge_b.set_(SharedQuantizationSpec(anchor=edge_a))
+  效果: 两个输入边指向同一个 Q 实例——是"强制共用"不是"什么都不做"
+```
+
+不标注之所以能工作，是因为 prepare 阶段只根据 annotation map 来决定插不插 Q/DQ——没有 annotation 的地方，prepare 就当它不存在，该 op 自然落在前一个 DQ 和后一个 Q 之间的 FP32 走廊。
+
+这就是 §11.3 的 `CONV_OPS`、`ADD_LIKE`、`PASSTHROUGH_OPS` 分组背后的设计逻辑——分组不是随机的，是按 Q/DQ 需求分的类。
+
+---
+
 ## 12. 三种模式对比：Eager / FX / PT2E
 
 | 维度 | Eager Mode | FX Graph Mode | PT2E |

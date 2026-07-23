@@ -134,17 +134,77 @@
 
 ---
 
-### Q15：Q/DQ 节点插在什么位置？有什么规则？
+### Q15：Q/DQ 节点插在什么位置？哪些算子需要，哪些不需要？
 
-| 算子 | 权重 Q | 激活输入 Q | 激活输出 DQ | 原因 |
-|------|--------|-----------|-----------|------|
-| Conv/Linear | ✅ per-channel | ✅ per-tensor | ✅ | 有 INT8 kernel |
-| ReLU/Pool | — | — | — | 前面 Conv 输出已是 INT8 |
-| Add/Concat | — | ✅ 共享 | ✅ | 多输入 scale 必须统一 |
-| Sigmoid/Tanh | — | 先 DQ | 再 Q | FP32 fallback |
-| Bias | Derived | — | — | S_bias = S_w × S_a |
+**核心判据一句话**："这个算子会改变 tensor 里每个元素的值吗？"
 
-→ 详见 [Stage 0 §7.8](Stage0_量化基础与硬件基石.md)，完整版在 [Stage 1 §11](Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md)
+- **值变** → 需要 Q/DQ（确保输入输出在正确的数值域）
+- **形变/搬运/选择** → 不需要 Q/DQ（INT8 值不动，照搬）
+
+具体分为五大类：
+
+**类别 A：INT8 kernel 算子 → 全 Q/DQ**
+
+| 算子 | 权重 Q | 输入 Q | 输出 DQ |
+|------|:--:|:--:|:--:|
+| Conv1d/2d/3d | ✅ per-channel | ✅ per-tensor | ✅ |
+| ConvTranspose | ✅ per-channel | ✅ per-tensor | ✅ |
+| Linear | ✅ per-channel | ✅ per-tensor | ✅ |
+
+**类别 B：多输入算子 → 共享 Q + DQ**
+
+Add / Sub / Mul / Concat / Cat。两个输入必须用同一个 scale 和 zero_point，否则整数运算无意义（`q₁=100, S₁=0.02` = 2.0，`q₂=40, S₂=0.05` 也 = 2.0 → 100+40=140 没意义）。
+
+**类别 C：没有 INT8 kernel → FP32 fallback → DQ + Q**
+
+Sigmoid / Tanh / Softmax / LayerNorm / GELU（无 LUT 时）。先 DQ 回 FP32 → FP32 计算 → Q 回 INT8。但如果用 LUT 查表（§7.6），Sigmoid/Tanh/GELU 可以走类别 D。
+
+**类别 D：纯搬运 → 不插任何 Q/DQ**
+
+Reshape / View / Flatten / Transpose / Permute / Squeeze / Unsqueeze / Slice / Split / Chunk / Pad / MaxPool2d / AvgPool2d / Dropout / Identity / ReLU（LUT 查表）。
+
+Pool 不需要 Q/DQ 的原因：Max 只比大小，INT8 比大小 = FP32 比大小（同一 scale 下是单调映射）；Avg 在 INT32 累加后取整即可。
+
+**类别 E：特殊**
+
+| 组件 | Q/DQ | 原因 |
+|------|:--:|------|
+| Bias | Derived | `S_bias = S_w × S_a`，不插独立 Q |
+| BatchNorm | ❌ | fuse 阶段已吸收进 Conv，图中不存在 |
+| 模型输入 | Q | 首层之前把 FP32 输入量化 |
+| 模型输出 | DQ | logits/bbox 需要 FP32 精度 |
+
+**常见误判速记**：
+- Reshape/Transpose 不需要 Q/DQ → 值没变，只是 view 变了
+- MaxPool 不需要 Q/DQ → 比大小不碰值
+- Concat 本身不插 Q → Q/DQ 插在输入分支上（共享 scale），拼完再 DQ
+
+**完整速查表**（30 种算子）：
+
+```
+算子             权重Q  输入Q  输出DQ   备注
+──────────────────────────────────────────────
+Add                    共享Q    ✅     类别B
+AvgPool2d                ❌     ❌     类别D
+Bias            Derived  —     —     类别E
+Cat                     共享Q    ✅     类别B
+Conv1d/2d/3d      ✅     ✅     ✅     类别A
+Concat                  共享Q    ✅     类别B
+Dropout                  ❌     ❌     类别D
+Flatten                  ❌     ❌     类别D
+GELU                    DQ     Q     类别C (有LUT则D)
+LayerNorm               DQ     Q     类别C
+Linear             ✅     ✅     ✅     类别A
+MaxPool2d                ❌     ❌     类别D
+Pad                      ❌     ❌     类别D
+ReLU                     ❌     ❌     类别D (LUT)
+Reshape                  ❌     ❌     类别D
+Sigmoid                 DQ     Q     类别C (有LUT则D)
+Softmax                 DQ    Q/FP32 类别C
+Transpose                ❌     ❌     类别D
+```
+
+→ 完整决策树 + 每个类别的 ASCII 数据流图见 [Stage 0 §7.8](Stage0_量化基础与硬件基石.md)
 
 ---
 

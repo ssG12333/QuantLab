@@ -1775,34 +1775,65 @@ LUT:  精度 = 原始函数精度（预计算时用的是 FP32），速度快，
 - 唯一一次"掉回 FP32"是最后一层的 Dequantize（或者遇到 Softmax/LayerNorm 等没有 LUT 的算子）
 - 这就是为什么量化推理可以快到 2-4×——不是 INT8 乘法快，是**整个数据流不需要离开整数域**
 
-### 7.8 Q/DQ 插入规则预览：哪些算子插什么？
+### 7.8 Q/DQ 插入规则：概念框架
 
-上面的数据流图里，每个 Conv 前后都有 QuantizeLinear/DequantizeLinear。但实际 PyTorch QAT 图里，**Q/DQ 的位置遵循一套严格的规则**。这里先画一张速查表作为一个心智锚点，具体实现在 Stage 1 的 PT2E Quantizer dispatch 逻辑里：
+> **核心判据一句话**："这个算子会改变 tensor 里每个元素的值吗？" —— 值变 → 需要 Q/DQ，形变/搬运/选择 → 不需要。
 
-| 算子类型 | 权重侧 | 激活输入侧 | 激活输出侧 | 为什么 |
-|---------|--------|-----------|-----------|--------|
-| **Conv / Linear** | Q (per-channel) | Q (per-tensor) | DQ | INT8 kernel 存在，输入需要量化 |
-| **ReLU / Pool** | 无权重 | 无 Q | 无 DQ | 前面 Conv 的输出已经是 INT8，ReLU LUT 直接消费 |
-| **Add / Concat** | 无权重 | 两个输入**共享**同一个 Q | DQ | 两个输入可能 scale 不同，必须先统一 scale 再加 |
-| **Sigmoid / Tanh** | 无权重 | DQ（输入） | Q（输出） | 没有 INT8 kernel → FP32 fallback → 再量化 |
-| **Bias** | Derived (不插 Q) | — | — | S_bias = S_w × S_a，从 weight 和 activation 推导 |
-| **BatchNorm** | 已 fuse 进 Conv | — | — | fuse 阶段 BN 被吸收，推理图中不存在 |
+所有算子按这个逻辑分入五个类别。下面是概念级速览——**完整工程速查表（30 种算子 + ASCII 数据流图 + 常见误判）见 [Stage 1 §11.7](Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) 的 Q/DQ 插入规则全表**。
+
+---
+
+#### 7.8.1 决策树：看一眼算子名就知道要不要 Q/DQ
 
 ```
-Conv 的完整 Q/DQ:
-  input(F32) → Q → DQ → Conv_INT8 → DQ → Q → 下一个 op
-                    ↑   weight 经由 Q 进入
-                    
-ReLU 不插 Q/DQ:
-  Conv_INT8 → DQ → ReLU_INT8(LUT) → 下一个 op (直接 INT8)
-  
-Add 共享 Q:
-  branch1(INT8) → DQ → Q(共享) ↘
-                                → Add_INT8 → DQ
-  branch2(INT8) → DQ → Q(共享) ↗
+                        ┌─ 这是算子 ─┐
+                        │            │
+                   有 weight？    无 weight
+                        │            │
+                   是 Conv/     值变？(乘加/激活函数/归一化)
+                 Linear/LSTM?       │
+                    │          是 ←──┼──→ 否
+                    │           │        │
+                    │      有 INT8  没有 INT8   Reshape / Transpose
+                    │      kernel?   kernel     Slice / Split / Pad
+                    │           │        │     MaxPool / AvgPool
+                    │         是       否       Dropout / Identity
+                    │           │        │        │
+                    ▼           ▼        ▼        ▼
+              ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────────┐
+              │ 类别 A    │ │ 类别 B    │ │ 类别 C        │ │ 类别 D        │
+              │ 全 Q/DQ   │ │ 共享 Q    │ │ FP32 fallback │ │ 纯搬运        │
+              │          │ │ + DQ      │ │ DQ→FP32→Q    │ │ 不插任何 Q/DQ │
+              └──────────┘ └──────────┘ └──────────────┘ └──────────────┘
+                   ▲              ▲              ▲              ▲
+              Conv/Linear    Add/Concat    Sigmoid/Tanh    Reshape/Transpose
+              ConvTranspose  Mul/Sub       Softmax         Slice/Split/Pad
+                                           LayerNorm       MaxPool/AvgPool
+                                           GELU/SiLU       ReLU(LUT)/Dropout
 ```
 
-> 这张表的完整版在 **Stage 1 §11** "Quantizer dispatch table"，包括 7 种 op 类型的 QSpec 注解逻辑、SharedQuantizationSpec 的 prepare 消费、DerivedQuantizationSpec 的 bias scale 推导。——读完这个锚点，进 Stage 1 时你已经有"整张图该长什么样"的心理预期。
+---
+
+#### 7.8.2 五大类一句话
+
+**类别 A：INT8 kernel 算子 → 全 Q/DQ**
+Conv、Linear、ConvTranspose。weight 走 Q（per-channel 对称），input 走 Q（per-tensor 非对称），output 走 DQ。这是量化推理的"主角"——VNNI/DP4A 指令在这里干活。
+
+**类别 B：多输入算子 → 共享 Q + DQ**
+Add、Sub、Mul、Concat。多个输入如果 scale 不同，同一个实数对应不同整数，直接运算无意义。必须先 DQ 回 FP32 → 用**同一个共享 scale**重新 Q → 再运算 → 最后 DQ。
+
+**类别 C：无 INT8 kernel → FP32 fallback → DQ + Q**
+Sigmoid、Tanh、Softmax、LayerNorm、GELU（无 LUT 时）。这些算子会改变值但硬件没有对应 INT8 指令——只能先 DQ 回 FP32 算完再 Q 回去。如果有 LUT（§7.6），Sigmoid/Tanh/GELU 可以跳到类别 D。
+
+**类别 D：纯搬运 → 不插任何 Q/DQ**
+Reshape、Transpose、Slice、Pad、MaxPool、AvgPool、Dropout、Identity、ReLU（LUT）。只改形状/顺序/子集，不改变值。INT8 进去 INT8 出来，不需要格式转换。Pool 可以直接在 INT8 上比大小（Max）或在 INT32 上累加取整（Avg），结果和 FP32 等价。
+
+**类别 E：特殊**
+Bias 走 Derived（`S_bias = S_w × S_a`，不插独立 Q）。BatchNorm 已在 fuse 阶段吸收进 Conv，推理图中不存在。模型输入之前插首层 Q，模型输出之后插尾层 DQ。
+
+---
+
+> **概念锚点够了。** 等你进入 Stage 1 跑出第一张 FX 量化图，看到一堆 q/dq 节点时——回来查 [Stage 1 §11.7 Q/DQ 插入规则全表](Stage1_PyTorch%20QAT%20PT2E%20深度拆解.md) 的完整 30 算子速查表。
 
 ---
 
