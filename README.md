@@ -42,6 +42,7 @@
 | 查 PyTorch 源码拆解笔记 | [🔍 源码分析](source-notes/README.md) |
 | 跑独立可运行代码 | [💻 代码实现](code/README.md) |
 | 读论文笔记 | [📝 论文笔记](paper-notes/README.md) |
+| 查学习中的疑问 | [❓ FAQ 问题速查](docs/FAQ_问题速查.md) |
 
 <br>
 
