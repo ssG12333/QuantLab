@@ -1618,6 +1618,192 @@ INT8 TensorCore (A100):
        对计算密集型: 加速可达 10×+
 ```
 
+### 7.5 隐藏概念 #1：INT32 累加器 + requantize —— 量化推理的"心跳"
+
+上面讲了 INT8 指令怎么并行算 4 个乘加。但有一个细节被跳过了：**INT8×INT8 的结果往哪存？**
+
+答案是 INT32 累加器。整个量化推理的核心循环不是"INT8 进 INT8 出"，而是三步：
+
+```
+每一层 Conv/Linear 的完整生命周期:
+
+  [1] 输入侧：FP32→INT8
+      activation:  r_a / S_a + Z_a  →  q_a ∈ [0, 255]
+      weight:      r_w / S_w        →  q_w ∈ [-128, 127]
+
+  [2] 计算：INT8×INT8 → INT32 累加
+      ┌─────────────────────────────────────────┐
+      │  for i in range(in_channels):            │
+      │      acc += q_a[i] × q_w[i]    ← INT32! │
+      │      // 不是 INT8, 也不是 FP32             │
+      │  acc += q_bias  (bias 保持 INT32)         │
+      └─────────────────────────────────────────┘
+      
+      为什么是 INT32?
+        INT8 × INT8 = [-128,127] × [0,255] → 最多 16-bit 的范围
+        但如果有 4096 个输入通道:
+          4096 × INT16 → 可能溢出 INT16（需要 ~28 bits）
+        → INT32 累加器保证永远不溢出（2^31-1 ≈ 2.1B）
+
+  [3] 输出侧：requantize — INT32 → INT8（给下一层）
+            acc(INT32) × S_a × S_w / S_out  ← requantize!
+       q_out = round(上面这步 + Z_out).clamp(q_min, q_max)
+       
+       requantize 公式:
+         q_out = round(acc × (S_a × S_w / S_out) + Z_out)
+         // 把 INT32 累加结果"压缩"回 INT8，交给下一层
+```
+
+**requantize 是"量化推理不掉回 FP32"的关键**。如果不用 requantize，每次 Conv 的输出都是 INT32 → 必须转 FP32 给下一层 → 下一层再转 INT8 → 来回转换吃掉所有加速。requantize 让数据**全程停留在整数域**：
+
+```
+Layer N:                        Layer N+1:
+  INT8 q_in                    ← q_out (INT8)
+     ↓                              ↑
+  INT32 acc  ──requantize──→  INT8 q_out
+     ↑
+  INT8 weight × INT8 activation
+```
+
+这就是你 ONNX 图里看到 `QuantizeLinear` → `Conv` → `DequantizeLinear` → `QuantizeLinear` → 下一个 `Conv` 的原因——每层都在做"INT32 requantize 回 INT8"。
+
+### 7.6 隐藏概念 #2：LUT 查表 — 没有 INT8 kernel 的算子怎么办
+
+Conv/Linear 有 VNNI/DP4A 硬件加速。但 Sigmoid、Tanh、GELU、Softmax 这些**非线性算子没有 INT8 指令**。两种策略：
+
+**策略 A：FP32 fallback（简单但慢）**
+
+```
+INT8 激活 → Dequantize → FP32 → Sigmoid(FP32) → Quantize → INT8
+                              ↑
+                         只有这一步在"真算"
+                         两头都在做格式转换
+```
+
+问题：每次遇到非线性就掉回 FP32，转换开销吃掉大部分加速。
+
+**策略 B：LUT 查表（快，工业标准）**
+
+预计算 256 个值，推理时直接查：
+
+```python
+# 离线: 建 LUT（只需要算一次）
+S = 0.02  # 激活的 scale
+Z = 0     # 激活的 zero_point
+
+# 对 INT8 的每个可能输入值，预计算 Sigmoid 输出
+lut = torch.zeros(256, dtype=torch.int32)
+for q_in in range(256):
+    r = S * (q_in - Z)          # 反量化: INT8 → FP32
+    r_out = torch.sigmoid(r)     # FP32 计算 Sigmoid
+    q_out = round(r_out / S)     # 量化: FP32 → INT8
+    lut[q_in] = q_out            # 存进表里
+
+# 推理时: O(1) 查表，零计算开销
+q_out = lut[q_in]               # 256 个条目的数组，一次内存读取
+```
+
+**LUT 为什么能工作？** INT8 只有 256 个可能的输入值。无论你的 batch 有多大、特征有多少——Sigmoid 的输入永远落在 256 个 INT8 值之一。提前把 256 种可能性都算好，推理时就是一次数组索引。
+
+**实际部署中的 LUT 策略：**
+
+| 算子 | LUT 大小 | 策略 |
+|------|---------|------|
+| Sigmoid | 256 × 1B = 256B | 直接查，零计算 |
+| Tanh | 256 × 1B = 256B | 直接查，零计算 |
+| GELU | 256 × 1B = 256B | 直接查——但 GELU 有近似公式 `x·Φ(x)`，也可以用 |
+| Softmax | 256×256 → 64KB（2D LUT） | 太大，通常用 FP32 fallback |
+| Swish/SiLU | 256 × 1B = 256B | LUT 或分段多项式近似 |
+
+**硬件上的 LUT**：高端推理芯片（如 H100、Apple ANE）在硬件里有专用的 LUT 单元——查表和 INT8 乘加可以在同一个时钟周期完成。低端芯片通常用 FP32 fallback。
+
+**LUT vs 近似公式**：
+
+```
+LUT:  精度 = 原始函数精度（预计算时用的是 FP32），速度快，内存小
+近似:  如 GELU ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+       → 需要算 tanh（又是一个 LUT）、乘法、加法
+       → 不如直接 GELU LUT 快
+```
+
+**一句话**：INT8 只有 256 个值 → 任何一元函数都可以变成 256 条目的查表 → 推理时 O(1)。这就是为什么量化推理不仅省内存，还可以比 FP32 **更快**——LUT 把"函数计算"变成了"数组索引"。
+
+### 7.7 画在一起：完整的一次量化推理 Forward Pass
+
+把 §7.5 和 §7.6 拼成一张完整的图——一个 Conv + ReLU + 下一个 Conv 的数据流：
+
+```
+  Input (FP32)
+      │
+      ▼
+  ┌──────────────────┐
+  │  QuantizeLinear   │  ← r/S_a + Z_a = q_a ∈ [0, 255]
+  └──────────────────┘
+      │ INT8
+      ▼
+  ┌──────────────────┐
+  │  Conv (INT8×INT8) │  ← VNNI: 4×INT8 mac/cycle
+  │  ↓ INT32 acc       │  ← acc 存在 INT32 寄存器
+  │  ↓ requantize      │  ← acc × (S_a×S_w/S_out) + Z_out
+  │  ↓ INT8 output     │  ← q_out ∈ [0, 255]
+  └──────────────────┘
+      │ INT8
+      ▼
+  ┌──────────────────┐
+  │  ReLU (LUT)       │  ← 256-entry LUT: q_out = lut[q_in]
+  │  零计算开销        │  ← max(0, q_in) 等价于 lut[q] = q if q>Z else Z
+  └──────────────────┘
+      │ INT8
+      ▼
+  ┌──────────────────┐
+  │  Conv (INT8×INT8) │  ← 下一层，直接消费 INT8
+  │  ↓ ...             │
+  └──────────────────┘
+      │
+      ▼
+  ┌──────────────────┐
+  │ DequantizeLinear  │  ← 最后一层输出才恢复 FP32
+  └──────────────────┘
+      │
+      ▼
+  Output (FP32)
+```
+
+**关键洞察**：
+- 数据从第一层 Conv 到最后输出，**全程在 INT8/INT32 域**
+- requantize 是层间桥梁（INT32→INT8），LUT 是非线性桥梁（INT8→查表→INT8）
+- 唯一一次"掉回 FP32"是最后一层的 Dequantize（或者遇到 Softmax/LayerNorm 等没有 LUT 的算子）
+- 这就是为什么量化推理可以快到 2-4×——不是 INT8 乘法快，是**整个数据流不需要离开整数域**
+
+### 7.8 Q/DQ 插入规则预览：哪些算子插什么？
+
+上面的数据流图里，每个 Conv 前后都有 QuantizeLinear/DequantizeLinear。但实际 PyTorch QAT 图里，**Q/DQ 的位置遵循一套严格的规则**。这里先画一张速查表作为一个心智锚点，具体实现在 Stage 1 的 PT2E Quantizer dispatch 逻辑里：
+
+| 算子类型 | 权重侧 | 激活输入侧 | 激活输出侧 | 为什么 |
+|---------|--------|-----------|-----------|--------|
+| **Conv / Linear** | Q (per-channel) | Q (per-tensor) | DQ | INT8 kernel 存在，输入需要量化 |
+| **ReLU / Pool** | 无权重 | 无 Q | 无 DQ | 前面 Conv 的输出已经是 INT8，ReLU LUT 直接消费 |
+| **Add / Concat** | 无权重 | 两个输入**共享**同一个 Q | DQ | 两个输入可能 scale 不同，必须先统一 scale 再加 |
+| **Sigmoid / Tanh** | 无权重 | DQ（输入） | Q（输出） | 没有 INT8 kernel → FP32 fallback → 再量化 |
+| **Bias** | Derived (不插 Q) | — | — | S_bias = S_w × S_a，从 weight 和 activation 推导 |
+| **BatchNorm** | 已 fuse 进 Conv | — | — | fuse 阶段 BN 被吸收，推理图中不存在 |
+
+```
+Conv 的完整 Q/DQ:
+  input(F32) → Q → DQ → Conv_INT8 → DQ → Q → 下一个 op
+                    ↑   weight 经由 Q 进入
+                    
+ReLU 不插 Q/DQ:
+  Conv_INT8 → DQ → ReLU_INT8(LUT) → 下一个 op (直接 INT8)
+  
+Add 共享 Q:
+  branch1(INT8) → DQ → Q(共享) ↘
+                                → Add_INT8 → DQ
+  branch2(INT8) → DQ → Q(共享) ↗
+```
+
+> 这张表的完整版在 **Stage 1 §11** "Quantizer dispatch table"，包括 7 种 op 类型的 QSpec 注解逻辑、SharedQuantizationSpec 的 prepare 消费、DerivedQuantizationSpec 的 bias scale 推导。——读完这个锚点，进 Stage 1 时你已经有"整张图该长什么样"的心理预期。
+
 ---
 
 ## 8. 量化误差分析：SNR 与误差预算
