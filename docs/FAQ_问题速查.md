@@ -208,6 +208,58 @@ Transpose                ❌     ❌     类别D
 
 ---
 
+### Q15.5：Server 和 Edge 的 Q/DQ 规则一样吗？QAT 仿真应该按哪个来？
+
+**答：不一样。QAT 的意义就是仿真目标硬件——硬件上怎么做量化，QAT 就怎么插 FQ。仿真越像，梯度越接近部署时的真实误差。**
+
+Q/DQ 规则不由"PT2E 默认策略"决定，而由目标硬件的真实量化行为决定：
+
+```
+Server（GPU，有 FP32 ALU，fallback 几乎零开销）:
+  AvgPool → 不插 FQ（掉回 FP32 算，省事）
+  MaxPool → 不插 FQ（INT8 比大小等价 FP32）
+  Reshape/Transpose → 不插 FQ（纯搬运，值不变）
+
+Edge（MCU/NPU/DSP，没有 FP32 ALU 或 FP32 慢 100×）:
+  AvgPool → 必须插 output FQ（全程 INT8，没有 FP32 走廊可掉）
+  MaxPool → 不插 FQ（同上，INT8 比大小能直接跑）
+  Reshape/Transpose → 不插 FQ（同上，纯搬运不碰值）
+
+关键差异只在 AvgPool：
+  Server: Conv → DQ → AvgPool(FP32) → Q → Conv  （AvgPool 透明）
+  Edge:   Conv_INT8 → requantize → AvgPool(INT8) → requantize → Conv
+                                ↑ 必须产出 INT8 → 必须有 output QSpec
+```
+
+**AvgPool 在端侧怎么算？** 没有 FP32 除法指令，靠 requantize 吸收 `÷kernel_size`：
+
+```
+AvgPool 2×2 = (q1+q2+q3+q4) / 4
+
+INT8 域改造:
+  1. 4 个 INT8 相加 → INT32 sum
+  2. q_out = round(sum × (S_in / 4×S_out) + Z_out)  ← "÷4" 吸进 scale 乘法
+  3. S_out 由端侧校准数据单独跑一次确定（逐层校准）
+```
+
+**核心原则**：
+
+```
+QAT 的 FQ 插入规则 ≠ PT2E 默认策略
+QAT 的 FQ 插入规则 = 目标硬件每层在哪个域跑 × 那里有没有 requantize
+
+确定流程:
+  1. 拿到目标芯片的算子支持列表 → 哪些 op 有 INT8 kernel？
+  2. 有 → 插 FQ（模拟 INT8 噪声）
+  3. 没有 → 芯片怎么处理？FP32 fallback → 不插 FQ
+                        INT8 变通（如 AvgPool 的 sum+requantize）→ 插 FQ
+  4. 把上面的规则写进 Quantizer.annotate()
+```
+
+**一句话**：QAT 不是为了"让 PT2E 跑通"，是为了"让训练时的梯度见过部署时会发生的量化噪声"。芯片在哪些地方发生量化，QAT 就在哪些地方插 FQ——不多插、不少插、不错插。
+
+---
+
 ## PYTHON / PYTORCH 导出坑
 
 ### Q16：Torch 2.6 PT2E 底层用的是 FX 图吗？
